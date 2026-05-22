@@ -1,10 +1,35 @@
 import crypto from 'crypto';
-import { Router } from 'express';
+import express, { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
-import type { ChatMessage } from '@freellmapi/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
+import type {
+  AudioFileUpload,
+  AudioTextResponseFormat,
+  AudioTranscriptionRequest,
+  AudioTranslationRequest,
+  ChatMessage,
+  EmbeddingInput,
+  ImageEditRequest,
+  ImageFileUpload,
+  ImageGenerationRequest,
+  ImageVariationRequest,
+  RealtimeSessionRequest,
+  SpeechRequest,
+} from '@freellmapi/shared/types.js';
+import {
+  routeCapabilityRequest,
+  routeRequest,
+  recordModelFailure,
+  recordRateLimitHit,
+  recordSuccess,
+  type RouteResult,
+} from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown } from '../services/ratelimit.js';
+import {
+  canRetryProviderFailure,
+  classifyProviderError,
+  type ClassifiedProviderError,
+} from '../services/provider-errors.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 
 export const proxyRouter = Router();
@@ -34,9 +59,36 @@ function getSessionKey(messages: ChatMessage[]): string {
   // stable across turns. Hash the FULL message (not a 100-char slice) so
   // distinct conversations with identical openings don't collide.
   const firstUser = messages.find(m => m.role === 'user');
-  if (!firstUser || typeof firstUser.content !== 'string') return '';
-  const hash = crypto.createHash('sha1').update(firstUser.content).digest('hex');
+  if (!firstUser) return '';
+  const content = serializeChatContent(firstUser.content);
+  if (!content) return '';
+  const hash = crypto.createHash('sha1').update(content).digest('hex');
   return `${hash}:${messages.length > 2 ? 'multi' : 'single'}`;
+}
+
+function serializeChatContent(content: ChatMessage['content']): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return JSON.stringify(content);
+  return '';
+}
+
+function hasImageContent(content: ChatMessage['content']): boolean {
+  return Array.isArray(content) && content.some(part => part.type === 'image_url');
+}
+
+function requiresVision(messages: ChatMessage[]): boolean {
+  return messages.some(m => hasImageContent(m.content));
+}
+
+function estimateChatContentTokens(content: ChatMessage['content']): number {
+  if (typeof content === 'string') return Math.ceil(content.length / 4);
+  if (!Array.isArray(content)) return 0;
+
+  return content.reduce((sum, part) => {
+    if (part.type === 'text') return sum + Math.ceil(part.text.length / 4);
+    // Conservative fixed cost so image requests avoid models with tiny budgets.
+    return sum + 250;
+  }, 0);
 }
 
 function getStickyModel(messages: ChatMessage[]): number | undefined {
@@ -106,9 +158,27 @@ const systemMessageSchema = z.object({
   name: z.string().optional(),
 });
 
+const chatTextContentPartSchema = z.object({
+  type: z.literal('text'),
+  text: z.string(),
+});
+
+const chatImageContentPartSchema = z.object({
+  type: z.literal('image_url'),
+  image_url: z.object({
+    url: z.string().min(1),
+    detail: z.enum(['auto', 'low', 'high']).optional(),
+  }),
+});
+
+const userContentSchema = z.union([
+  z.string(),
+  z.array(z.union([chatTextContentPartSchema, chatImageContentPartSchema])).min(1),
+]);
+
 const userMessageSchema = z.object({
   role: z.literal('user'),
-  content: z.string(),
+  content: userContentSchema,
   name: z.string().optional(),
 });
 
@@ -169,19 +239,92 @@ const chatCompletionSchema = z.object({
   parallel_tool_calls: z.boolean().optional(),
 });
 
-function isRetryableError(err: any): boolean {
-  const msg = (err.message ?? '').toLowerCase();
-  return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
-    || msg.includes('quota') || msg.includes('resource_exhausted')
-    || msg.includes('aborted') || msg.includes('timeout') || msg.includes('etimedout')
-    || msg.includes('econnrefused') || msg.includes('econnreset')
-    || msg.includes('503') || msg.includes('unavailable')
-    || msg.includes('500') || msg.includes('internal server error');
+const embeddingInputSchema: z.ZodType<EmbeddingInput> = z.union([
+  z.string(),
+  z.array(z.string()).min(1),
+  z.array(z.number()).min(1),
+  z.array(z.array(z.number()).min(1)).min(1),
+]);
+
+const embeddingsSchema = z.object({
+  input: embeddingInputSchema,
+  model: z.string().optional(),
+  encoding_format: z.enum(['float', 'base64']).optional(),
+  dimensions: z.number().int().positive().optional(),
+  user: z.string().optional(),
+});
+
+const imageGenerationSchema: z.ZodType<ImageGenerationRequest> = z.object({
+  prompt: z.string().min(1),
+  model: z.string().optional(),
+  n: z.number().int().min(1).max(1).optional(),
+  size: z.string().optional(),
+  quality: z.enum(['auto', 'standard', 'hd', 'low', 'medium', 'high']).optional(),
+  response_format: z.enum(['url', 'b64_json']).optional(),
+  style: z.enum(['vivid', 'natural']).optional(),
+  user: z.string().optional(),
+});
+
+const speechSchema: z.ZodType<SpeechRequest> = z.object({
+  input: z.string().min(1),
+  voice: z.string().min(1),
+  model: z.string().optional(),
+  response_format: z.enum(['mp3', 'opus', 'aac', 'flac', 'wav', 'pcm']).optional(),
+  speed: z.number().min(0.25).max(4).optional(),
+  instructions: z.string().optional(),
+  user: z.string().optional(),
+});
+
+const realtimeSessionSchema: z.ZodType<RealtimeSessionRequest> = z.object({
+  model: z.string().optional(),
+  provider: z.literal('google').optional(),
+  instructions: z.string().optional(),
+  voice: z.string().min(1).optional(),
+  response_modalities: z.array(z.enum(['AUDIO', 'TEXT'])).min(1).max(2).optional(),
+  input_audio_transcription: z.boolean().optional(),
+  output_audio_transcription: z.boolean().optional(),
+  temperature: z.number().min(0).max(2).optional(),
+  expires_in_seconds: z.number().int().min(60).max(20 * 60 * 60).optional(),
+  user: z.string().optional(),
+});
+
+const multipartParser = express.raw({
+  type: (req) => {
+    const contentType = req.headers['content-type'];
+    return typeof contentType === 'string'
+      && contentType.toLowerCase().startsWith('multipart/form-data');
+  },
+  limit: '25mb',
+});
+
+const AUDIO_TEXT_FORMATS = new Set<AudioTextResponseFormat>([
+  'json',
+  'text',
+  'srt',
+  'verbose_json',
+  'vtt',
+]);
+const AUDIO_TIMESTAMP_GRANULARITIES = new Set(['word', 'segment']);
+
+type AudioTextOperation = 'transcription' | 'translation';
+type ImageOperation = 'edit' | 'variation';
+
+interface MultipartPart {
+  name: string;
+  filename?: string;
+  contentType: string;
+  data: Buffer;
 }
 
-proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
-  const start = Date.now();
+type ParsedAudioTextRequest =
+  | { ok: true; request: AudioTranscriptionRequest | AudioTranslationRequest }
+  | { ok: false; message: string };
 
+type ParsedImageRequest =
+  | { ok: true; request: ImageEditRequest | ImageVariationRequest }
+  | { ok: false; message: string };
+
+function authenticateProxyRequest(req: Request, res: Response): boolean {
   // Authenticate with unified API key. Local requests (127.0.0.1) skip the check
   // since they came from the same machine running the server. Non-local requests
   // MUST present a valid Bearer token — missing or wrong → 401.
@@ -191,16 +334,312 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // If a future change enables `trust proxy`, this localhost bypass MUST be
   // re-evaluated.
   const isLocal = req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1';
-  if (!isLocal) {
-    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
-    const unifiedKey = getUnifiedApiKey();
-    if (!token || !timingSafeStringEqual(token, unifiedKey)) {
-      res.status(401).json({
-        error: { message: 'Invalid API key', type: 'authentication_error' },
-      });
-      return;
+  if (isLocal) return true;
+
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  const unifiedKey = getUnifiedApiKey();
+  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+    res.status(401).json({
+      error: { message: 'Invalid API key', type: 'authentication_error' },
+    });
+    return false;
+  }
+
+  return true;
+}
+
+function parseAudioTextRequest(req: Request, operation: AudioTextOperation): ParsedAudioTextRequest {
+  const contentType = req.headers['content-type'] ?? '';
+  const boundary = parseMultipartBoundary(String(contentType));
+  if (!boundary || !Buffer.isBuffer(req.body)) {
+    return { ok: false, message: 'audio requests must use multipart/form-data' };
+  }
+
+  const parts = parseMultipartBody(req.body, boundary);
+  const fields = new Map<string, string[]>();
+  let file: AudioFileUpload | undefined;
+
+  for (const part of parts) {
+    if (part.filename) {
+      if (part.name === 'file' && !file) {
+        file = {
+          filename: part.filename,
+          contentType: part.contentType || 'application/octet-stream',
+          data: new Uint8Array(part.data),
+        };
+      }
+      continue;
+    }
+
+    const existing = fields.get(part.name) ?? [];
+    existing.push(part.data.toString('utf8'));
+    fields.set(part.name, existing);
+  }
+
+  const getField = (name: string) => {
+    const values = fields.get(name);
+    return values?.[values.length - 1];
+  };
+
+  const responseFormat = getField('response_format') as AudioTextResponseFormat | undefined;
+  if (responseFormat && !AUDIO_TEXT_FORMATS.has(responseFormat)) {
+    return { ok: false, message: `response_format '${responseFormat}' is not supported` };
+  }
+
+  const temperatureRaw = getField('temperature');
+  let temperature: number | undefined;
+  if (temperatureRaw !== undefined && temperatureRaw !== '') {
+    temperature = Number(temperatureRaw);
+    if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
+      return { ok: false, message: 'temperature must be a number between 0 and 2' };
     }
   }
+
+  const url = getField('url');
+  if (!file && !url) {
+    return { ok: false, message: "audio requests must include a 'file' upload or 'url' field" };
+  }
+
+  const base = {
+    model: getField('model'),
+    file,
+    url,
+    prompt: getField('prompt'),
+    response_format: responseFormat,
+    temperature,
+    user: getField('user'),
+  };
+
+  if (operation === 'translation') {
+    return { ok: true, request: base satisfies AudioTranslationRequest };
+  }
+
+  const timestampGranularities = [
+    ...(fields.get('timestamp_granularities[]') ?? []),
+    ...(fields.get('timestamp_granularities') ?? []),
+  ];
+  for (const granularity of timestampGranularities) {
+    if (!AUDIO_TIMESTAMP_GRANULARITIES.has(granularity)) {
+      return { ok: false, message: "timestamp_granularities must contain only 'word' or 'segment'" };
+    }
+  }
+
+  return {
+    ok: true,
+    request: {
+      ...base,
+      language: getField('language'),
+      timestamp_granularities: timestampGranularities.length > 0
+        ? timestampGranularities as Array<'word' | 'segment'>
+        : undefined,
+    } satisfies AudioTranscriptionRequest,
+  };
+}
+
+function parseImageRequest(req: Request, operation: ImageOperation): ParsedImageRequest {
+  const contentType = req.headers['content-type'] ?? '';
+  const boundary = parseMultipartBoundary(String(contentType));
+  if (!boundary || !Buffer.isBuffer(req.body)) {
+    return { ok: false, message: 'image requests must use multipart/form-data' };
+  }
+
+  const parts = parseMultipartBody(req.body, boundary);
+  const fields = new Map<string, string[]>();
+  const images: ImageFileUpload[] = [];
+  let mask: ImageFileUpload | undefined;
+
+  for (const part of parts) {
+    if (part.filename) {
+      const upload = {
+        filename: part.filename,
+        contentType: part.contentType || 'application/octet-stream',
+        data: new Uint8Array(part.data),
+      } satisfies ImageFileUpload;
+      if (part.name === 'image') images.push(upload);
+      if (part.name === 'mask' && !mask) mask = upload;
+      continue;
+    }
+
+    const existing = fields.get(part.name) ?? [];
+    existing.push(part.data.toString('utf8'));
+    fields.set(part.name, existing);
+  }
+
+  const getField = (name: string) => {
+    const values = fields.get(name);
+    return values?.[values.length - 1];
+  };
+
+  const responseFormat = getField('response_format') as 'url' | 'b64_json' | undefined;
+  if (responseFormat && responseFormat !== 'url' && responseFormat !== 'b64_json') {
+    return { ok: false, message: `response_format '${responseFormat}' is not supported` };
+  }
+
+  const nRaw = getField('n');
+  let n: number | undefined;
+  if (nRaw !== undefined && nRaw !== '') {
+    n = Number(nRaw);
+    if (!Number.isInteger(n) || n < 1 || n > 1) {
+      return { ok: false, message: 'n must be 1 for the configured image provider' };
+    }
+  }
+
+  if (images.length === 0) {
+    return { ok: false, message: "image requests must include at least one 'image' upload" };
+  }
+
+  const base = {
+    model: getField('model'),
+    n,
+    size: getField('size'),
+    response_format: responseFormat,
+    user: getField('user'),
+  };
+
+  if (operation === 'variation') {
+    return {
+      ok: true,
+      request: {
+        ...base,
+        image: images[0],
+      } satisfies ImageVariationRequest,
+    };
+  }
+
+  const prompt = getField('prompt');
+  if (!prompt) {
+    return { ok: false, message: "image edits must include a non-empty 'prompt' field" };
+  }
+
+  return {
+    ok: true,
+    request: {
+      ...base,
+      images,
+      mask,
+      prompt,
+    } satisfies ImageEditRequest,
+  };
+}
+
+function parseMultipartBoundary(contentType: string): string | null {
+  const match = /(?:^|;)\s*boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType);
+  return match?.[1] ?? match?.[2] ?? null;
+}
+
+function parseMultipartBody(body: Buffer, boundary: string): MultipartPart[] {
+  const boundaryBuffer = Buffer.from(`--${boundary}`);
+  const sections = splitBuffer(body, boundaryBuffer);
+  const parts: MultipartPart[] = [];
+
+  for (let section of sections) {
+    if (section.length === 0) continue;
+    if (section.subarray(0, 2).toString('ascii') === '--') continue;
+    if (section.subarray(0, 2).toString('ascii') === '\r\n') section = section.subarray(2);
+    if (section.subarray(section.length - 2).toString('ascii') === '\r\n') {
+      section = section.subarray(0, section.length - 2);
+    }
+
+    const headerEnd = section.indexOf(Buffer.from('\r\n\r\n'));
+    if (headerEnd < 0) continue;
+
+    const headers = section.subarray(0, headerEnd).toString('latin1').split('\r\n');
+    const data = section.subarray(headerEnd + 4);
+    const disposition = headers.find(h => h.toLowerCase().startsWith('content-disposition:')) ?? '';
+    const contentTypeHeader = headers.find(h => h.toLowerCase().startsWith('content-type:'));
+    const { name, filename } = parseContentDisposition(disposition);
+    if (!name) continue;
+
+    parts.push({
+      name,
+      filename,
+      contentType: contentTypeHeader?.split(':').slice(1).join(':').trim() ?? 'text/plain',
+      data,
+    });
+  }
+
+  return parts;
+}
+
+function splitBuffer(buffer: Buffer, separator: Buffer): Buffer[] {
+  const result: Buffer[] = [];
+  let offset = 0;
+  let index = buffer.indexOf(separator, offset);
+
+  while (index !== -1) {
+    result.push(buffer.subarray(offset, index));
+    offset = index + separator.length;
+    index = buffer.indexOf(separator, offset);
+  }
+
+  result.push(buffer.subarray(offset));
+  return result;
+}
+
+function parseContentDisposition(header: string): { name?: string; filename?: string } {
+  const params: { name?: string; filename?: string } = {};
+  for (const segment of header.split(';').slice(1)) {
+    const [rawKey, ...rawValueParts] = segment.trim().split('=');
+    const rawValue = rawValueParts.join('=');
+    const value = rawValue.replace(/^"|"$/g, '');
+    if (rawKey === 'name') params.name = value;
+    if (rawKey === 'filename') params.filename = value;
+  }
+  return params;
+}
+
+function estimateEmbeddingTokens(input: EmbeddingInput): number {
+  if (typeof input === 'string') return Math.ceil(input.length / 4);
+
+  let total = 0;
+  for (const item of input) {
+    if (typeof item === 'string') {
+      total += Math.ceil(item.length / 4);
+    } else if (Array.isArray(item)) {
+      total += item.length;
+    } else {
+      total += 1;
+    }
+  }
+  return total;
+}
+
+function recordRouteFailure(route: RouteResult, failure: ClassifiedProviderError, message: string) {
+  if (failure.category === 'rate_limit') {
+    recordRateLimitHit(route.modelDbId);
+  } else {
+    recordModelFailure(route.modelDbId, failure.category, message);
+  }
+}
+
+function prepareProviderRetry(
+  route: RouteResult,
+  failure: ClassifiedProviderError,
+  err: any,
+  skipKeys: Set<string>,
+  skipModels: Set<number>,
+) {
+  const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
+  skipKeys.add(skipId);
+  if (failure.keyCooldownMs > 0) {
+    setCooldown(route.platform, route.modelId, route.keyId, failure.keyCooldownMs);
+  }
+  if (failure.skipModel) {
+    skipModels.add(route.modelDbId);
+  }
+  recordRouteFailure(route, failure, err.message);
+}
+
+function recordTerminalProviderFailure(route: RouteResult, failure: ClassifiedProviderError, err: any) {
+  if (failure.skipModel || failure.category === 'rate_limit') {
+    recordRouteFailure(route, failure, err.message);
+  }
+}
+
+proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
+  const start = Date.now();
+
+  if (!authenticateProxyRequest(req, res)) return;
 
   // Validate request
   const parsed = chatCompletionSchema.safeParse(req.body);
@@ -214,7 +653,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return;
   }
 
-  const { model: requestedModel, temperature, max_tokens, top_p, stream, tools, tool_choice, parallel_tool_calls } = parsed.data;
+  const { model: rawRequestedModel, temperature, max_tokens, top_p, stream, tools, tool_choice, parallel_tool_calls } = parsed.data;
+  const requestedModel = rawRequestedModel === 'auto' ? undefined : rawRequestedModel;
   const messages: ChatMessage[] = parsed.data.messages.map((m): ChatMessage => {
     if (m.role === 'assistant') {
       return {
@@ -252,11 +692,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // Non-streaming requests reconcile against the provider's real `usage` block
   // (see line ~340). Streaming will drift from real consumption — accepted
   // tradeoff because per-request usage isn't always returned mid-stream.
-  const estimatedInputTokens = messages.reduce((sum, m) => {
-    if (typeof m.content !== 'string') return sum;
-    return sum + Math.ceil(m.content.length / 4);
-  }, 0);
+  const estimatedInputTokens = messages.reduce((sum, m) => sum + estimateChatContentTokens(m.content), 0);
   const estimatedTotal = estimatedInputTokens + (max_tokens ?? 1000);
+  const needsVision = requiresVision(messages);
 
   // Explicit `model` field pins routing. If the catalog has no enabled row
   // matching the requested id, return 400 — silently auto-routing to a
@@ -265,33 +703,82 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   let preferredModel: number | undefined;
   if (requestedModel) {
     const db = getDb();
-    const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
-    if (enabled) {
-      preferredModel = enabled.id;
+    if (needsVision) {
+      const row = db.prepare(`
+        SELECT m.id, m.enabled AS model_enabled, mc.enabled AS capability_enabled
+        FROM models m
+        LEFT JOIN model_capabilities mc
+          ON mc.model_db_id = m.id AND mc.capability = 'vision'
+        WHERE m.model_id = ?
+      `).get(requestedModel) as { id: number; model_enabled: number; capability_enabled: number | null } | undefined;
+
+      if (!row || !row.capability_enabled) {
+        const reason = row ? 'does not support vision' : 'is not in the catalog';
+        res.status(400).json({
+          error: {
+            message: `Model '${requestedModel}' ${reason}. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+            type: 'invalid_request_error',
+            code: 'model_not_found',
+          },
+        });
+        return;
+      }
+
+      if (row.model_enabled !== 1) {
+        res.status(400).json({
+          error: {
+            message: `Model '${requestedModel}' is disabled. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+            type: 'invalid_request_error',
+            code: 'model_not_found',
+          },
+        });
+        return;
+      }
+
+      preferredModel = row.id;
     } else {
-      const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
-      const reason = disabled ? 'is disabled' : 'is not in the catalog';
-      res.status(400).json({
-        error: {
-          message: `Model '${requestedModel}' ${reason}. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
-          type: 'invalid_request_error',
-          code: 'model_not_found',
-        },
-      });
-      return;
+      const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+      if (enabled) {
+        preferredModel = enabled.id;
+      } else {
+        const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
+        const reason = disabled ? 'is disabled' : 'is not in the catalog';
+        res.status(400).json({
+          error: {
+            message: `Model '${requestedModel}' ${reason}. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+            type: 'invalid_request_error',
+            code: 'model_not_found',
+          },
+        });
+        return;
+      }
     }
-  } else {
+  } else if (!needsVision) {
     preferredModel = getStickyModel(messages);
   }
 
   // Retry loop: on 429/rate limit, skip that model+key and try the next one
   const skipKeys = new Set<string>();
+  const skipModels = new Set<number>();
   let lastError: any = null;
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel);
+      route = needsVision
+        ? routeCapabilityRequest(
+          'vision',
+          estimatedTotal,
+          skipKeys.size > 0 ? skipKeys : undefined,
+          requestedModel,
+          skipModels.size > 0 ? skipModels : undefined,
+        )
+        : routeRequest(
+          estimatedTotal,
+          skipKeys.size > 0 ? skipKeys : undefined,
+          preferredModel,
+          skipModels.size > 0 ? skipModels : undefined,
+        );
     } catch (err: any) {
       // No more models available
       if (lastError) {
@@ -394,16 +881,17 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       const latency = Date.now() - start;
       logRequest(route.platform, route.modelId, 'error', estimatedInputTokens, 0, latency, err.message);
 
-      if (isRetryableError(err)) {
-        // Put this model+key on cooldown and try the next one
-        const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
-        skipKeys.add(skipId);
-        setCooldown(route.platform, route.modelId, route.keyId, 120_000);
-        recordRateLimitHit(route.modelDbId);
+      const failure = classifyProviderError(err);
+      const canFallback = canRetryProviderFailure(failure, requestedModel);
+
+      if (canFallback) {
+        prepareProviderRetry(route, failure, err, skipKeys, skipModels);
         lastError = err;
-        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, falling back (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, falling back (${failure.category}, attempt ${attempt + 1}/${MAX_RETRIES})`);
         continue;
       }
+
+      recordTerminalProviderFailure(route, failure, err);
 
       // Non-retryable error (auth, 4xx, etc.): don't retry
       res.status(502).json({
@@ -420,6 +908,837 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   res.status(429).json({
     error: {
       message: `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`,
+      type: 'rate_limit_error',
+    },
+  });
+});
+
+proxyRouter.post('/embeddings', async (req: Request, res: Response) => {
+  const start = Date.now();
+
+  if (!authenticateProxyRequest(req, res)) return;
+
+  const parsed = embeddingsSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: {
+        message: `Invalid request: ${parsed.error.errors.map(e => e.message).join(', ')}`,
+        type: 'invalid_request_error',
+      },
+    });
+    return;
+  }
+
+  const { input, model: rawRequestedModel, encoding_format, dimensions, user } = parsed.data;
+  const requestedModel = rawRequestedModel === 'auto' ? undefined : rawRequestedModel;
+
+  if (requestedModel) {
+    const db = getDb();
+    const row = db.prepare(`
+      SELECT m.id, mc.enabled AS capability_enabled, m.enabled AS model_enabled
+      FROM models m
+      LEFT JOIN model_capabilities mc
+        ON mc.model_db_id = m.id AND mc.capability = 'embeddings'
+      WHERE m.model_id = ?
+    `).get(requestedModel) as { id: number; capability_enabled: number | null; model_enabled: number } | undefined;
+
+    if (!row || !row.capability_enabled) {
+      const reason = row ? 'does not support embeddings' : 'is not in the catalog';
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' ${reason}. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+
+    if (row.model_enabled !== 1) {
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' is disabled. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+  }
+
+  const estimatedTokens = estimateEmbeddingTokens(input);
+  const skipKeys = new Set<string>();
+  const skipModels = new Set<number>();
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    let route: RouteResult;
+    try {
+      route = routeCapabilityRequest(
+        'embeddings',
+        estimatedTokens,
+        skipKeys.size > 0 ? skipKeys : undefined,
+        requestedModel,
+        skipModels.size > 0 ? skipModels : undefined,
+      );
+    } catch (err: any) {
+      res.status(err.status ?? 503).json({
+        error: {
+          message: lastError ? `All embeddings models rate-limited. Last error: ${lastError.message}` : err.message,
+          type: lastError ? 'rate_limit_error' : 'routing_error',
+        },
+      });
+      return;
+    }
+
+    recordRequest(route.platform, route.modelId, route.keyId);
+
+    try {
+      const result = await route.provider.createEmbedding(
+        route.apiKey,
+        input,
+        route.modelId,
+        { encoding_format, dimensions, user },
+      );
+
+      const totalTokens = result.usage?.total_tokens ?? estimatedTokens;
+      recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
+      recordSuccess(route.modelDbId);
+
+      res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+      if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+      res.json(result);
+
+      logRequest(
+        route.platform, route.modelId, 'success',
+        result.usage?.prompt_tokens ?? estimatedTokens,
+        0,
+        Date.now() - start, null,
+      );
+      return;
+    } catch (err: any) {
+      const latency = Date.now() - start;
+      logRequest(route.platform, route.modelId, 'error', estimatedTokens, 0, latency, err.message);
+
+      const failure = classifyProviderError(err);
+      if (canRetryProviderFailure(failure, requestedModel)) {
+        prepareProviderRetry(route, failure, err, skipKeys, skipModels);
+        lastError = err;
+        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, falling back (${failure.category}, attempt ${attempt + 1}/${MAX_RETRIES})`);
+        continue;
+      }
+
+      recordTerminalProviderFailure(route, failure, err);
+
+      res.status(502).json({
+        error: {
+          message: `Provider error (${route.displayName}): ${err.message}`,
+          type: 'provider_error',
+        },
+      });
+      return;
+    }
+  }
+
+  res.status(429).json({
+    error: {
+      message: `All embeddings models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`,
+      type: 'rate_limit_error',
+    },
+  });
+});
+
+proxyRouter.post('/images/generations', async (req: Request, res: Response) => {
+  const start = Date.now();
+
+  if (!authenticateProxyRequest(req, res)) return;
+
+  const parsed = imageGenerationSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: {
+        message: `Invalid request: ${parsed.error.errors.map(e => e.message).join(', ')}`,
+        type: 'invalid_request_error',
+      },
+    });
+    return;
+  }
+
+  const request = {
+    ...parsed.data,
+    model: parsed.data.model === 'auto' ? undefined : parsed.data.model,
+    response_format: parsed.data.response_format ?? 'b64_json',
+  } satisfies ImageGenerationRequest;
+  const requestedModel = request.model;
+
+  if (requestedModel) {
+    const db = getDb();
+    const row = db.prepare(`
+      SELECT m.id, mc.enabled AS capability_enabled, m.enabled AS model_enabled
+      FROM models m
+      LEFT JOIN model_capabilities mc
+        ON mc.model_db_id = m.id AND mc.capability = 'image_generation'
+      WHERE m.model_id = ?
+    `).get(requestedModel) as { id: number; capability_enabled: number | null; model_enabled: number } | undefined;
+
+    if (!row || !row.capability_enabled) {
+      const reason = row ? 'does not support image generation' : 'is not in the catalog';
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' ${reason}. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+
+    if (row.model_enabled !== 1) {
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' is disabled. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+  }
+
+  const estimatedTokens = Math.ceil(request.prompt.length / 4) + 1000;
+  const skipKeys = new Set<string>();
+  const skipModels = new Set<number>();
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    let route: RouteResult;
+    try {
+      route = routeCapabilityRequest(
+        'image_generation',
+        estimatedTokens,
+        skipKeys.size > 0 ? skipKeys : undefined,
+        requestedModel,
+        skipModels.size > 0 ? skipModels : undefined,
+      );
+    } catch (err: any) {
+      res.status(err.status ?? 503).json({
+        error: {
+          message: lastError ? `All image generation models rate-limited. Last error: ${lastError.message}` : err.message,
+          type: lastError ? 'rate_limit_error' : 'routing_error',
+        },
+      });
+      return;
+    }
+
+    recordRequest(route.platform, route.modelId, route.keyId);
+
+    try {
+      const result = await route.provider.createImage(route.apiKey, request, route.modelId);
+
+      recordTokens(route.platform, route.modelId, route.keyId, estimatedTokens);
+      recordSuccess(route.modelDbId);
+
+      res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+      if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+      res.json(result);
+
+      logRequest(route.platform, route.modelId, 'success', estimatedTokens, 0, Date.now() - start, null);
+      return;
+    } catch (err: any) {
+      const latency = Date.now() - start;
+      logRequest(route.platform, route.modelId, 'error', estimatedTokens, 0, latency, err.message);
+
+      const failure = classifyProviderError(err);
+      if (canRetryProviderFailure(failure, requestedModel)) {
+        prepareProviderRetry(route, failure, err, skipKeys, skipModels);
+        lastError = err;
+        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, falling back (${failure.category}, attempt ${attempt + 1}/${MAX_RETRIES})`);
+        continue;
+      }
+
+      recordTerminalProviderFailure(route, failure, err);
+
+      res.status(502).json({
+        error: {
+          message: `Provider error (${route.displayName}): ${err.message}`,
+          type: 'provider_error',
+        },
+      });
+      return;
+    }
+  }
+
+  res.status(429).json({
+    error: {
+      message: `All image generation models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`,
+      type: 'rate_limit_error',
+    },
+  });
+});
+
+proxyRouter.post('/images/edits', multipartParser, async (req: Request, res: Response) => {
+  await handleImageRequest(req, res, 'edit');
+});
+
+proxyRouter.post('/images/variations', multipartParser, async (req: Request, res: Response) => {
+  await handleImageRequest(req, res, 'variation');
+});
+
+async function handleImageRequest(req: Request, res: Response, operation: ImageOperation) {
+  const start = Date.now();
+
+  if (!authenticateProxyRequest(req, res)) return;
+
+  const parsed = parseImageRequest(req, operation);
+  if (!parsed.ok) {
+    res.status(400).json({
+      error: {
+        message: `Invalid request: ${parsed.message}`,
+        type: 'invalid_request_error',
+      },
+    });
+    return;
+  }
+
+  const capability = operation === 'edit' ? 'image_edit' : 'image_variation';
+  const actionLabel = operation === 'edit' ? 'image edits' : 'image variations';
+  const request = {
+    ...parsed.request,
+    model: parsed.request.model === 'auto' ? undefined : parsed.request.model,
+    response_format: parsed.request.response_format ?? 'b64_json',
+  };
+  const requestedModel = request.model;
+
+  if (requestedModel) {
+    const db = getDb();
+    const row = db.prepare(`
+      SELECT m.id, mc.enabled AS capability_enabled, m.enabled AS model_enabled
+      FROM models m
+      LEFT JOIN model_capabilities mc
+        ON mc.model_db_id = m.id AND mc.capability = ?
+      WHERE m.model_id = ?
+    `).get(capability, requestedModel) as { id: number; capability_enabled: number | null; model_enabled: number } | undefined;
+
+    if (!row || !row.capability_enabled) {
+      const reason = row ? `does not support ${actionLabel}` : 'is not in the catalog';
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' ${reason}. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+
+    if (row.model_enabled !== 1) {
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' is disabled. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+  }
+
+  const estimatedTokens = estimateImageRequestTokens(request);
+  const skipKeys = new Set<string>();
+  const skipModels = new Set<number>();
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    let route: RouteResult;
+    try {
+      route = routeCapabilityRequest(
+        capability,
+        estimatedTokens,
+        skipKeys.size > 0 ? skipKeys : undefined,
+        requestedModel,
+        skipModels.size > 0 ? skipModels : undefined,
+      );
+    } catch (err: any) {
+      res.status(err.status ?? 503).json({
+        error: {
+          message: lastError ? `All ${actionLabel} models rate-limited. Last error: ${lastError.message}` : err.message,
+          type: lastError ? 'rate_limit_error' : 'routing_error',
+        },
+      });
+      return;
+    }
+
+    recordRequest(route.platform, route.modelId, route.keyId);
+
+    try {
+      const result = operation === 'edit'
+        ? await route.provider.editImage(route.apiKey, request as ImageEditRequest, route.modelId)
+        : await route.provider.createImageVariation(route.apiKey, request as ImageVariationRequest, route.modelId);
+
+      recordTokens(route.platform, route.modelId, route.keyId, estimatedTokens);
+      recordSuccess(route.modelDbId);
+
+      res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+      if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+      res.json(result);
+
+      logRequest(route.platform, route.modelId, 'success', estimatedTokens, 0, Date.now() - start, null);
+      return;
+    } catch (err: any) {
+      const latency = Date.now() - start;
+      logRequest(route.platform, route.modelId, 'error', estimatedTokens, 0, latency, err.message);
+
+      const failure = classifyProviderError(err);
+      if (canRetryProviderFailure(failure, requestedModel)) {
+        prepareProviderRetry(route, failure, err, skipKeys, skipModels);
+        lastError = err;
+        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, falling back (${failure.category}, attempt ${attempt + 1}/${MAX_RETRIES})`);
+        continue;
+      }
+
+      recordTerminalProviderFailure(route, failure, err);
+
+      res.status(502).json({
+        error: {
+          message: `Provider error (${route.displayName}): ${err.message}`,
+          type: 'provider_error',
+        },
+      });
+      return;
+    }
+  }
+
+  res.status(429).json({
+    error: {
+      message: `All ${actionLabel} models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`,
+      type: 'rate_limit_error',
+    },
+  });
+}
+
+function estimateImageRequestTokens(request: ImageEditRequest | ImageVariationRequest): number {
+  const promptTokens = 'prompt' in request ? Math.ceil(request.prompt.length / 4) : 0;
+  return promptTokens + 1000;
+}
+
+proxyRouter.post('/audio/transcriptions', multipartParser, async (req: Request, res: Response) => {
+  await handleAudioTextRequest(req, res, 'transcription');
+});
+
+proxyRouter.post('/audio/translations', multipartParser, async (req: Request, res: Response) => {
+  await handleAudioTextRequest(req, res, 'translation');
+});
+
+async function handleAudioTextRequest(req: Request, res: Response, operation: AudioTextOperation) {
+  const start = Date.now();
+
+  if (!authenticateProxyRequest(req, res)) return;
+
+  const parsed = parseAudioTextRequest(req, operation);
+  if (!parsed.ok) {
+    res.status(400).json({
+      error: {
+        message: `Invalid request: ${parsed.message}`,
+        type: 'invalid_request_error',
+      },
+    });
+    return;
+  }
+
+  const capability = operation === 'transcription' ? 'transcription' : 'translation';
+  const actionLabel = operation === 'transcription' ? 'transcription' : 'translation';
+  const request = {
+    ...parsed.request,
+    model: parsed.request.model === 'auto' ? undefined : parsed.request.model,
+  };
+  const requestedModel = request.model;
+
+  if (requestedModel) {
+    const db = getDb();
+    const row = db.prepare(`
+      SELECT m.id, mc.enabled AS capability_enabled, m.enabled AS model_enabled
+      FROM models m
+      LEFT JOIN model_capabilities mc
+        ON mc.model_db_id = m.id AND mc.capability = ?
+      WHERE m.model_id = ?
+    `).get(capability, requestedModel) as { id: number; capability_enabled: number | null; model_enabled: number } | undefined;
+
+    if (!row || !row.capability_enabled) {
+      const reason = row ? `does not support ${actionLabel}` : 'is not in the catalog';
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' ${reason}. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+
+    if (row.model_enabled !== 1) {
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' is disabled. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+  }
+
+  const estimatedTokens = estimateAudioTextTokens(request);
+  const skipKeys = new Set<string>();
+  const skipModels = new Set<number>();
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    let route: RouteResult;
+    try {
+      route = routeCapabilityRequest(
+        capability,
+        estimatedTokens,
+        skipKeys.size > 0 ? skipKeys : undefined,
+        requestedModel,
+        skipModels.size > 0 ? skipModels : undefined,
+      );
+    } catch (err: any) {
+      res.status(err.status ?? 503).json({
+        error: {
+          message: lastError ? `All audio ${actionLabel} models rate-limited. Last error: ${lastError.message}` : err.message,
+          type: lastError ? 'rate_limit_error' : 'routing_error',
+        },
+      });
+      return;
+    }
+
+    recordRequest(route.platform, route.modelId, route.keyId);
+
+    try {
+      const result = operation === 'transcription'
+        ? await route.provider.transcribeAudio(route.apiKey, request as AudioTranscriptionRequest, route.modelId)
+        : await route.provider.translateAudio(route.apiKey, request as AudioTranslationRequest, route.modelId);
+
+      recordTokens(route.platform, route.modelId, route.keyId, estimatedTokens);
+      recordSuccess(route.modelDbId);
+
+      res.setHeader('Content-Type', result.contentType);
+      res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+      if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+
+      if (result.contentType.includes('application/json')) {
+        res.send(JSON.stringify(result.body));
+      } else {
+        res.send(typeof result.body === 'string' ? result.body : JSON.stringify(result.body));
+      }
+
+      logRequest(route.platform, route.modelId, 'success', estimatedTokens, 0, Date.now() - start, null);
+      return;
+    } catch (err: any) {
+      const latency = Date.now() - start;
+      logRequest(route.platform, route.modelId, 'error', estimatedTokens, 0, latency, err.message);
+
+      const failure = classifyProviderError(err);
+      if (canRetryProviderFailure(failure, requestedModel)) {
+        prepareProviderRetry(route, failure, err, skipKeys, skipModels);
+        lastError = err;
+        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, falling back (${failure.category}, attempt ${attempt + 1}/${MAX_RETRIES})`);
+        continue;
+      }
+
+      recordTerminalProviderFailure(route, failure, err);
+
+      res.status(502).json({
+        error: {
+          message: `Provider error (${route.displayName}): ${err.message}`,
+          type: 'provider_error',
+        },
+      });
+      return;
+    }
+  }
+
+  res.status(429).json({
+    error: {
+      message: `All audio ${actionLabel} models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`,
+      type: 'rate_limit_error',
+    },
+  });
+}
+
+function estimateAudioTextTokens(request: AudioTranscriptionRequest | AudioTranslationRequest): number {
+  const promptTokens = Math.ceil((request.prompt?.length ?? 0) / 4);
+  const urlTokens = Math.ceil((request.url?.length ?? 0) / 4);
+  return Math.max(100, promptTokens + urlTokens + 100);
+}
+
+proxyRouter.post('/realtime/sessions', async (req: Request, res: Response) => {
+  const start = Date.now();
+
+  if (!authenticateProxyRequest(req, res)) return;
+
+  const parsed = realtimeSessionSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: {
+        message: `Invalid request: ${parsed.error.errors.map(e => e.message).join(', ')}`,
+        type: 'invalid_request_error',
+      },
+    });
+    return;
+  }
+
+  const request = {
+    ...parsed.data,
+    model: parsed.data.model === 'auto' ? undefined : parsed.data.model,
+    provider: parsed.data.provider ?? 'google',
+    response_modalities: parsed.data.response_modalities ?? ['AUDIO'],
+    expires_in_seconds: parsed.data.expires_in_seconds ?? 30 * 60,
+  } satisfies RealtimeSessionRequest;
+  const requestedModel = request.model;
+
+  if (requestedModel) {
+    const db = getDb();
+    const row = db.prepare(`
+      SELECT m.id, mc.enabled AS capability_enabled, m.enabled AS model_enabled
+      FROM models m
+      LEFT JOIN model_capabilities mc
+        ON mc.model_db_id = m.id AND mc.capability = 'realtime_audio'
+      WHERE m.model_id = ?
+    `).get(requestedModel) as { id: number; capability_enabled: number | null; model_enabled: number } | undefined;
+
+    if (!row || !row.capability_enabled) {
+      const reason = row ? 'does not support realtime audio' : 'is not in the catalog';
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' ${reason}. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+
+    if (row.model_enabled !== 1) {
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' is disabled. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+  }
+
+  const estimatedTokens = 1;
+  const skipKeys = new Set<string>();
+  const skipModels = new Set<number>();
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    let route: RouteResult;
+    try {
+      route = routeCapabilityRequest(
+        'realtime_audio',
+        estimatedTokens,
+        skipKeys.size > 0 ? skipKeys : undefined,
+        requestedModel,
+        skipModels.size > 0 ? skipModels : undefined,
+      );
+    } catch (err: any) {
+      res.status(err.status ?? 503).json({
+        error: {
+          message: lastError ? `All realtime audio models rate-limited. Last error: ${lastError.message}` : err.message,
+          type: lastError ? 'rate_limit_error' : 'routing_error',
+        },
+      });
+      return;
+    }
+
+    recordRequest(route.platform, route.modelId, route.keyId);
+
+    try {
+      const result = await route.provider.createRealtimeSession(route.apiKey, request, route.modelId);
+
+      recordTokens(route.platform, route.modelId, route.keyId, estimatedTokens);
+      recordSuccess(route.modelDbId);
+
+      res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+      if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+      res.json(result);
+
+      logRequest(route.platform, route.modelId, 'success', estimatedTokens, 0, Date.now() - start, null);
+      return;
+    } catch (err: any) {
+      const latency = Date.now() - start;
+      logRequest(route.platform, route.modelId, 'error', estimatedTokens, 0, latency, err.message);
+
+      const failure = classifyProviderError(err);
+      if (canRetryProviderFailure(failure, requestedModel)) {
+        prepareProviderRetry(route, failure, err, skipKeys, skipModels);
+        lastError = err;
+        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, falling back (${failure.category}, attempt ${attempt + 1}/${MAX_RETRIES})`);
+        continue;
+      }
+
+      recordTerminalProviderFailure(route, failure, err);
+
+      res.status(502).json({
+        error: {
+          message: `Provider error (${route.displayName}): ${err.message}`,
+          type: 'provider_error',
+        },
+      });
+      return;
+    }
+  }
+
+  res.status(429).json({
+    error: {
+      message: `All realtime audio models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`,
+      type: 'rate_limit_error',
+    },
+  });
+});
+
+proxyRouter.post('/audio/speech', async (req: Request, res: Response) => {
+  const start = Date.now();
+
+  if (!authenticateProxyRequest(req, res)) return;
+
+  const parsed = speechSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: {
+        message: `Invalid request: ${parsed.error.errors.map(e => e.message).join(', ')}`,
+        type: 'invalid_request_error',
+      },
+    });
+    return;
+  }
+
+  const request = {
+    ...parsed.data,
+    model: parsed.data.model === 'auto' ? undefined : parsed.data.model,
+    response_format: parsed.data.response_format ?? 'wav',
+  } satisfies SpeechRequest;
+  const requestedModel = request.model;
+
+  if (request.response_format && !['wav', 'pcm'].includes(request.response_format)) {
+    res.status(400).json({
+      error: {
+        message: `response_format '${request.response_format}' is not currently supported by the configured speech provider. Use 'wav' or 'pcm'.`,
+        type: 'invalid_request_error',
+        code: 'unsupported_response_format',
+      },
+    });
+    return;
+  }
+
+  if (requestedModel) {
+    const db = getDb();
+    const row = db.prepare(`
+      SELECT m.id, mc.enabled AS capability_enabled, m.enabled AS model_enabled
+      FROM models m
+      LEFT JOIN model_capabilities mc
+        ON mc.model_db_id = m.id AND mc.capability = 'speech'
+      WHERE m.model_id = ?
+    `).get(requestedModel) as { id: number; capability_enabled: number | null; model_enabled: number } | undefined;
+
+    if (!row || !row.capability_enabled) {
+      const reason = row ? 'does not support speech' : 'is not in the catalog';
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' ${reason}. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+
+    if (row.model_enabled !== 1) {
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' is disabled. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+  }
+
+  const estimatedTokens = Math.ceil(request.input.length / 4);
+  const skipKeys = new Set<string>();
+  const skipModels = new Set<number>();
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    let route: RouteResult;
+    try {
+      route = routeCapabilityRequest(
+        'speech',
+        estimatedTokens,
+        skipKeys.size > 0 ? skipKeys : undefined,
+        requestedModel,
+        skipModels.size > 0 ? skipModels : undefined,
+      );
+    } catch (err: any) {
+      res.status(err.status ?? 503).json({
+        error: {
+          message: lastError ? `All speech models rate-limited. Last error: ${lastError.message}` : err.message,
+          type: lastError ? 'rate_limit_error' : 'routing_error',
+        },
+      });
+      return;
+    }
+
+    recordRequest(route.platform, route.modelId, route.keyId);
+
+    try {
+      const result = await route.provider.createSpeech(route.apiKey, request, route.modelId);
+
+      recordTokens(route.platform, route.modelId, route.keyId, estimatedTokens);
+      recordSuccess(route.modelDbId);
+
+      const audio = Buffer.from(result.data);
+      res.setHeader('Content-Type', result.contentType);
+      res.setHeader('Content-Length', String(audio.byteLength));
+      res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+      if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+      res.send(audio);
+
+      logRequest(route.platform, route.modelId, 'success', estimatedTokens, 0, Date.now() - start, null);
+      return;
+    } catch (err: any) {
+      const latency = Date.now() - start;
+      logRequest(route.platform, route.modelId, 'error', estimatedTokens, 0, latency, err.message);
+
+      const failure = classifyProviderError(err);
+      if (canRetryProviderFailure(failure, requestedModel)) {
+        prepareProviderRetry(route, failure, err, skipKeys, skipModels);
+        lastError = err;
+        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, falling back (${failure.category}, attempt ${attempt + 1}/${MAX_RETRIES})`);
+        continue;
+      }
+
+      recordTerminalProviderFailure(route, failure, err);
+
+      res.status(502).json({
+        error: {
+          message: `Provider error (${route.displayName}): ${err.message}`,
+          type: 'provider_error',
+        },
+      });
+      return;
+    }
+  }
+
+  res.status(429).json({
+    error: {
+      message: `All speech models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`,
       type: 'rate_limit_error',
     },
   });

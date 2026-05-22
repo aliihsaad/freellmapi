@@ -36,6 +36,17 @@ const keyStmt = db.prepare(`
 
 const results: { row: Row; ok: boolean; ms: number; error?: string; reply?: string }[] = [];
 
+function previewContent(content: unknown): string {
+  if (typeof content === 'string') return content.slice(0, 40);
+  if (Array.isArray(content)) {
+    return content
+      .map(part => (part && typeof part === 'object' && 'text' in part ? String(part.text ?? '') : ''))
+      .join('')
+      .slice(0, 40);
+  }
+  return '';
+}
+
 for (const row of models) {
   const keyRow = keyStmt.get(row.platform) as Key | undefined;
   if (!keyRow) { results.push({ row, ok: false, ms: 0, error: 'no key' }); continue; }
@@ -46,7 +57,7 @@ for (const row of models) {
   const start = Date.now();
   try {
     const res = await provider.chatCompletion(apiKey, [{ role: 'user', content: 'hi' }], row.model_id, { max_tokens: 5 });
-    const reply = res.choices?.[0]?.message?.content?.slice(0, 40) ?? '';
+    const reply = previewContent(res.choices?.[0]?.message?.content);
     results.push({ row, ok: true, ms: Date.now() - start, reply });
   } catch (err: any) {
     results.push({ row, ok: false, ms: Date.now() - start, error: String(err?.message ?? err).slice(0, 200) });

@@ -4,7 +4,21 @@ import type {
   ChatCompletionChunk,
   ChatToolDefinition,
   ChatToolChoice,
+  EmbeddingInput,
+  EmbeddingOptions,
+  EmbeddingResponse,
+  ImageEditRequest,
+  ImageVariationRequest,
+  ImageGenerationRequest,
+  ImagesResponse,
   Platform,
+  AudioTextResult,
+  AudioTranscriptionRequest,
+  AudioTranslationRequest,
+  RealtimeSessionRequest,
+  RealtimeSessionResponse,
+  SpeechRequest,
+  SpeechResult,
 } from '@freellmapi/shared/types.js';
 
 export interface CompletionOptions {
@@ -34,6 +48,71 @@ export abstract class BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): AsyncGenerator<ChatCompletionChunk>;
+
+  async createEmbedding(
+    _apiKey: string,
+    _input: EmbeddingInput,
+    _modelId: string,
+    _options?: EmbeddingOptions,
+  ): Promise<EmbeddingResponse> {
+    throw new Error(`${this.name} does not support embeddings`);
+  }
+
+  async createImage(
+    _apiKey: string,
+    _request: ImageGenerationRequest,
+    _modelId: string,
+  ): Promise<ImagesResponse> {
+    throw new Error(`${this.name} does not support image generation`);
+  }
+
+  async editImage(
+    _apiKey: string,
+    _request: ImageEditRequest,
+    _modelId: string,
+  ): Promise<ImagesResponse> {
+    throw new Error(`${this.name} does not support image edits`);
+  }
+
+  async createImageVariation(
+    _apiKey: string,
+    _request: ImageVariationRequest,
+    _modelId: string,
+  ): Promise<ImagesResponse> {
+    throw new Error(`${this.name} does not support image variations`);
+  }
+
+  async createSpeech(
+    _apiKey: string,
+    _request: SpeechRequest,
+    _modelId: string,
+  ): Promise<SpeechResult> {
+    throw new Error(`${this.name} does not support speech`);
+  }
+
+  async transcribeAudio(
+    _apiKey: string,
+    _request: AudioTranscriptionRequest,
+    _modelId: string,
+  ): Promise<AudioTextResult> {
+    throw new Error(`${this.name} does not support transcription`);
+  }
+
+  async translateAudio(
+    _apiKey: string,
+    _request: AudioTranslationRequest,
+    _modelId: string,
+  ): Promise<AudioTextResult> {
+    throw new Error(`${this.name} does not support translation`);
+  }
+
+  async createRealtimeSession(
+    _apiKey: string,
+    _request: RealtimeSessionRequest,
+    _modelId: string,
+  ): Promise<RealtimeSessionResponse> {
+    throw new Error(`${this.name} does not support realtime sessions`);
+  }
 
   abstract validateKey(apiKey: string): Promise<boolean>;
 

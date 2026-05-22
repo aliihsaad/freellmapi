@@ -38,6 +38,38 @@ export interface Model {
   enabled: boolean;
 }
 
+export type ModelCapability = 'chat' | 'embeddings' | 'vision' | 'images' | 'audio';
+
+export interface CapabilityLight {
+  supportedModels: number;
+  configured: boolean;
+  status: 'configured' | 'missing_key' | 'unsupported';
+}
+
+export interface ProviderMetadata {
+  platform: Platform;
+  displayName: string;
+  docsUrl: string;
+  keyUrl?: string;
+  consoleUrl?: string;
+  apiBaseUrl: string;
+  requiresKey: boolean;
+}
+
+export interface ProviderCapabilitySummary extends ProviderMetadata {
+  keyCount: number;
+  capabilities: Record<ModelCapability, CapabilityLight>;
+}
+
+export interface CapabilitiesResponse {
+  capabilities: ModelCapability[];
+  providers: ProviderCapabilitySummary[];
+}
+
+export interface ProvidersResponse {
+  providers: ProviderMetadata[];
+}
+
 export type KeyStatus = 'healthy' | 'rate_limited' | 'invalid' | 'error' | 'unknown';
 
 export interface ApiKey {
@@ -67,6 +99,50 @@ export interface FallbackEntry {
   speedRank: number;
   priority: number;
   enabled: boolean;
+}
+
+// ---- Model Sweep Types ----
+
+export type ModelSweepStatus = 'running' | 'completed' | 'failed';
+export type ModelSweepResultStatus = 'passed' | 'failed' | 'skipped';
+export type ModelSweepErrorCategory =
+  | 'zero_quota'
+  | 'rate_limit'
+  | 'model_unavailable'
+  | 'timeout'
+  | 'provider'
+  | 'auth'
+  | 'other';
+
+export interface ModelSweepResult {
+  modelDbId: number;
+  platform: Platform | string;
+  providerDisplayName: string;
+  modelId: string;
+  displayName: string;
+  status: ModelSweepResultStatus;
+  latencyMs: number | null;
+  errorCategory: ModelSweepErrorCategory | null;
+  error: string | null;
+  keyAttempts: number;
+}
+
+export interface ModelSweepJob {
+  id: string;
+  status: ModelSweepStatus;
+  total: number;
+  completed: number;
+  passed: number;
+  failed: number;
+  quarantined: number;
+  startedAt: string;
+  updatedAt: string;
+  finishedAt: string | null;
+  elapsedMs: number;
+  estimatedRemainingMs: number | null;
+  currentModel: string | null;
+  note: string;
+  results: ModelSweepResult[];
 }
 
 // ---- OpenAI-Compatible Types ----
@@ -106,9 +182,25 @@ export type ChatToolChoice =
     };
   };
 
+export interface ChatTextContentPart {
+  type: 'text';
+  text: string;
+}
+
+export interface ChatImageUrlContentPart {
+  type: 'image_url';
+  image_url: {
+    url: string;
+    detail?: 'auto' | 'low' | 'high';
+  };
+}
+
+export type ChatContentPart = ChatTextContentPart | ChatImageUrlContentPart;
+export type ChatMessageContent = string | ChatContentPart[] | null;
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string | null;
+  content: ChatMessageContent;
   name?: string;
   tool_call_id?: string;
   tool_calls?: ChatToolCall[];
@@ -167,6 +259,202 @@ export interface ChatCompletionChunk {
   }[];
 }
 
+// ---- Embeddings Types ----
+
+export type EmbeddingInput = string | string[] | number[] | number[][];
+
+export interface EmbeddingOptions {
+  encoding_format?: 'float' | 'base64';
+  dimensions?: number;
+  user?: string;
+}
+
+export interface EmbeddingRequest extends EmbeddingOptions {
+  model?: string;
+  input: EmbeddingInput;
+}
+
+export interface Embedding {
+  object: 'embedding';
+  embedding: number[] | string;
+  index: number;
+}
+
+export interface EmbeddingUsage {
+  prompt_tokens: number;
+  total_tokens: number;
+}
+
+export interface EmbeddingResponse {
+  object: 'list';
+  data: Embedding[];
+  model: string;
+  usage: EmbeddingUsage;
+  _routed_via?: {
+    platform: Platform;
+    model: string;
+  };
+}
+
+// ---- Images Types ----
+
+export interface ImageGenerationRequest {
+  model?: string;
+  prompt: string;
+  n?: number;
+  size?: string;
+  quality?: 'auto' | 'standard' | 'hd' | 'low' | 'medium' | 'high';
+  response_format?: 'url' | 'b64_json';
+  style?: 'vivid' | 'natural';
+  user?: string;
+}
+
+export interface ImageData {
+  url?: string;
+  b64_json?: string;
+  revised_prompt?: string;
+}
+
+export interface ImagesResponse {
+  created: number;
+  data: ImageData[];
+  _routed_via?: {
+    platform: Platform;
+    model: string;
+  };
+}
+
+export interface ImageFileUpload {
+  filename: string;
+  contentType: string;
+  data: Uint8Array;
+}
+
+export interface ImageEditRequest {
+  model?: string;
+  images: ImageFileUpload[];
+  mask?: ImageFileUpload;
+  prompt: string;
+  n?: number;
+  size?: string;
+  response_format?: 'url' | 'b64_json';
+  user?: string;
+}
+
+export interface ImageVariationRequest {
+  model?: string;
+  image: ImageFileUpload;
+  n?: number;
+  size?: string;
+  response_format?: 'url' | 'b64_json';
+  user?: string;
+}
+
+// ---- Audio / Speech Types ----
+
+export type SpeechResponseFormat = 'mp3' | 'opus' | 'aac' | 'flac' | 'wav' | 'pcm';
+
+export interface SpeechRequest {
+  model?: string;
+  input: string;
+  voice: string;
+  response_format?: SpeechResponseFormat;
+  speed?: number;
+  instructions?: string;
+  user?: string;
+}
+
+export interface SpeechResult {
+  data: Uint8Array;
+  contentType: string;
+  format: SpeechResponseFormat;
+  _routed_via?: {
+    platform: Platform;
+    model: string;
+  };
+}
+
+export type AudioTextResponseFormat = 'json' | 'text' | 'srt' | 'verbose_json' | 'vtt';
+
+export interface AudioFileUpload {
+  filename: string;
+  contentType: string;
+  data: Uint8Array;
+}
+
+export interface AudioTranscriptionRequest {
+  model?: string;
+  file?: AudioFileUpload;
+  url?: string;
+  language?: string;
+  prompt?: string;
+  response_format?: AudioTextResponseFormat;
+  temperature?: number;
+  timestamp_granularities?: Array<'word' | 'segment'>;
+  user?: string;
+}
+
+export interface AudioTranslationRequest {
+  model?: string;
+  file?: AudioFileUpload;
+  url?: string;
+  prompt?: string;
+  response_format?: AudioTextResponseFormat;
+  temperature?: number;
+  user?: string;
+}
+
+export interface AudioTextResult {
+  body: unknown;
+  contentType: string;
+  _routed_via?: {
+    platform: Platform;
+    model: string;
+  };
+}
+
+// ---- Realtime Audio Types ----
+
+export type RealtimeResponseModality = 'AUDIO' | 'TEXT';
+
+export interface RealtimeSessionRequest {
+  model?: string;
+  provider?: 'google';
+  instructions?: string;
+  voice?: string;
+  response_modalities?: RealtimeResponseModality[];
+  input_audio_transcription?: boolean;
+  output_audio_transcription?: boolean;
+  temperature?: number;
+  expires_in_seconds?: number;
+  user?: string;
+}
+
+export interface RealtimeSessionResponse {
+  object: 'realtime.session';
+  id: string;
+  provider: Platform;
+  model: string;
+  expires_at: number;
+  client_secret: {
+    value: string;
+    expires_at: number;
+  };
+  connect_url: string;
+  config: {
+    response_modalities: RealtimeResponseModality[];
+    input_audio_transcription?: boolean;
+    output_audio_transcription?: boolean;
+    voice?: string;
+    instructions?: string;
+    temperature?: number;
+  };
+  _routed_via?: {
+    platform: Platform;
+    model: string;
+  };
+}
+
 // ---- Analytics Types ----
 
 export interface AnalyticsSummary {
@@ -187,6 +475,49 @@ export interface PlatformStats {
   totalOutputTokens: number;
 }
 
+export type UsagePressure = 'low' | 'medium' | 'high' | 'critical';
+export type UsageEstimateSource = 'local_tokens' | 'session_mint';
+
+export interface UsageEstimateModel {
+  platform: Platform | string;
+  modelId: string;
+  displayName: string;
+  requests: number;
+  usedTokens: number;
+  estimatedMonthlyBudget: number;
+  usagePercent: number;
+  pressure: UsagePressure;
+  usageText: string;
+  usageSource: UsageEstimateSource;
+}
+
+export interface UsageEstimateProvider {
+  platform: Platform | string;
+  requests: number;
+  activeKeyCount: number;
+  modelCount: number;
+  usedTokens: number;
+  estimatedMonthlyBudget: number;
+  usagePercent: number;
+  pressure: UsagePressure;
+  usageText: string;
+  topModels: UsageEstimateModel[];
+}
+
+export interface UsageEstimatesResponse {
+  range: string;
+  generatedAt: string;
+  note: string;
+  total: {
+    usedTokens: number;
+    estimatedMonthlyBudget: number;
+    usagePercent: number;
+    pressure: UsagePressure;
+    usageText: string;
+  };
+  providers: UsageEstimateProvider[];
+}
+
 export interface TimelinePoint {
   timestamp: string;
   requests: number;
@@ -204,6 +535,85 @@ export interface RequestLog {
   latencyMs: number;
   error: string | null;
   createdAt: string;
+}
+
+// ---- Logs / Diagnostics Types ----
+
+export type LogErrorCategory =
+  | 'zero_quota'
+  | 'rate_limit'
+  | 'auth'
+  | 'forbidden'
+  | 'not_found'
+  | 'timeout'
+  | 'provider'
+  | 'routing'
+  | 'other';
+
+export type DiagnosticSeverity = 'info' | 'warning' | 'critical';
+
+export interface LogSummary {
+  totalRequests: number;
+  successCount: number;
+  errorCount: number;
+  successRate: number;
+  avgLatencyMs: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalTokens: number;
+  activeProviders: number;
+}
+
+export interface DiagnosticFlag {
+  id: string;
+  category: LogErrorCategory;
+  severity: DiagnosticSeverity;
+  title: string;
+  detail: string;
+  recommendation: string;
+  count: number;
+  platform: Platform | string;
+  modelId: string | null;
+}
+
+export interface ProviderRanking {
+  rank: number;
+  platform: Platform | string;
+  score: number;
+  status: 'excellent' | 'good' | 'degraded' | 'blocked' | 'idle';
+  requests: number;
+  errors: number;
+  successRate: number;
+  avgLatencyMs: number;
+  totalTokens: number;
+  keyCount: number;
+  healthyKeys: number;
+  invalidKeys: number;
+  penalty: number;
+  topFlag: LogErrorCategory | null;
+  recommendation: string;
+}
+
+export interface LogEntry {
+  id: number;
+  platform: Platform | string;
+  modelId: string;
+  status: 'success' | 'error';
+  inputTokens: number;
+  outputTokens: number;
+  latencyMs: number;
+  error: string | null;
+  errorCategory: LogErrorCategory | null;
+  severity: DiagnosticSeverity;
+  suggestion: string;
+  createdAt: string;
+}
+
+export interface LogsDiagnosticsResponse {
+  summary: LogSummary;
+  flags: DiagnosticFlag[];
+  rankings: ProviderRanking[];
+  recent: LogEntry[];
 }
 
 // ---- Rate Limit Types ----

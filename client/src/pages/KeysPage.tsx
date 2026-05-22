@@ -6,24 +6,26 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { PageHeader } from '@/components/page-header'
-import type { ApiKey, Platform } from '../../../shared/types'
+import { ProviderHelperLinks } from '@/components/provider-helper-links'
+import { Info } from 'lucide-react'
+import type { ApiKey, Platform, ProviderMetadata, ProvidersResponse } from '../../../shared/types'
 
-const PLATFORMS: { value: Platform; label: string }[] = [
-  { value: 'google', label: 'Google AI Studio' },
-  { value: 'groq', label: 'Groq' },
-  { value: 'cerebras', label: 'Cerebras' },
-  { value: 'sambanova', label: 'SambaNova' },
-  { value: 'nvidia', label: 'NVIDIA NIM' },
-  { value: 'mistral', label: 'Mistral' },
-  { value: 'openrouter', label: 'OpenRouter' },
-  { value: 'github', label: 'GitHub Models' },
-  { value: 'cohere', label: 'Cohere' },
-  { value: 'cloudflare', label: 'Cloudflare Workers AI' },
-  { value: 'zhipu', label: 'Zhipu AI (Z.ai)' },
-  { value: 'ollama', label: 'Ollama Cloud' },
-  { value: 'kilo', label: 'Kilo Gateway (anon ok)' },
-  { value: 'pollinations', label: 'Pollinations (anon ok)' },
-  { value: 'llm7', label: 'LLM7 (anon ok)' },
+const FALLBACK_PROVIDERS: ProviderMetadata[] = [
+  { platform: 'google', displayName: 'Google AI Studio', docsUrl: '', apiBaseUrl: '', requiresKey: true },
+  { platform: 'groq', displayName: 'Groq', docsUrl: '', apiBaseUrl: '', requiresKey: true },
+  { platform: 'cerebras', displayName: 'Cerebras', docsUrl: '', apiBaseUrl: '', requiresKey: true },
+  { platform: 'sambanova', displayName: 'SambaNova', docsUrl: '', apiBaseUrl: '', requiresKey: true },
+  { platform: 'nvidia', displayName: 'NVIDIA NIM', docsUrl: '', apiBaseUrl: '', requiresKey: true },
+  { platform: 'mistral', displayName: 'Mistral', docsUrl: '', apiBaseUrl: '', requiresKey: true },
+  { platform: 'openrouter', displayName: 'OpenRouter', docsUrl: '', apiBaseUrl: '', requiresKey: true },
+  { platform: 'github', displayName: 'GitHub Models', docsUrl: '', apiBaseUrl: '', requiresKey: true },
+  { platform: 'cohere', displayName: 'Cohere', docsUrl: '', apiBaseUrl: '', requiresKey: true },
+  { platform: 'cloudflare', displayName: 'Cloudflare Workers AI', docsUrl: '', apiBaseUrl: '', requiresKey: true },
+  { platform: 'zhipu', displayName: 'Zhipu AI', docsUrl: '', apiBaseUrl: '', requiresKey: true },
+  { platform: 'ollama', displayName: 'Ollama Cloud', docsUrl: '', apiBaseUrl: '', requiresKey: true },
+  { platform: 'kilo', displayName: 'Kilo Gateway', docsUrl: '', apiBaseUrl: '', requiresKey: false },
+  { platform: 'pollinations', displayName: 'Pollinations', docsUrl: '', apiBaseUrl: '', requiresKey: false },
+  { platform: 'llm7', displayName: 'LLM7', docsUrl: '', apiBaseUrl: '', requiresKey: false },
 ]
 
 const statusDot: Record<string, string> = {
@@ -137,6 +139,11 @@ export default function KeysPage() {
     queryFn: () => apiFetch('/api/keys'),
   })
 
+  const { data: providersData } = useQuery<ProvidersResponse>({
+    queryKey: ['models', 'providers'],
+    queryFn: () => apiFetch('/api/models/providers'),
+  })
+
   const { data: healthData } = useQuery<HealthData>({
     queryKey: ['health'],
     queryFn: () => apiFetch('/api/health'),
@@ -194,9 +201,12 @@ export default function KeysPage() {
   const healthKeyMap = new Map<number, { status: string; lastCheckedAt: string | null }>()
   for (const k of healthData?.keys ?? []) healthKeyMap.set(k.id, k)
 
-  const grouped = PLATFORMS.map(p => ({
+  const providers = providersData?.providers ?? FALLBACK_PROVIDERS
+  const selectedProvider = platform ? providers.find(p => p.platform === platform) : undefined
+
+  const grouped = providers.map(p => ({
     ...p,
-    keys: keys.filter(k => k.platform === p.value),
+    keys: keys.filter(k => k.platform === p.platform),
   })).filter(p => p.keys.length > 0)
 
   return (
@@ -218,6 +228,12 @@ export default function KeysPage() {
 
         <section>
           <h2 className="text-sm font-medium mb-3">Add a provider key</h2>
+          <div className="mb-3 flex items-start gap-2 rounded-lg border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
+            <Info className="mt-0.5 size-3.5 flex-shrink-0 text-foreground/70" aria-hidden="true" />
+            <p>
+              For higher usable quota, add keys from separate provider accounts or projects. Keys from the same account may still share provider-side limits even though this proxy rotates and tracks them separately.
+            </p>
+          </div>
           <form onSubmit={handleSubmit} className="flex flex-wrap items-end gap-3 rounded-lg border p-4 bg-card">
             <div className="space-y-1.5">
               <Label className="text-xs">Platform</Label>
@@ -226,11 +242,14 @@ export default function KeysPage() {
                   <SelectValue placeholder="Select provider" />
                 </SelectTrigger>
                 <SelectContent>
-                  {PLATFORMS.map(p => (
-                    <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>
+                  {providers.map(p => (
+                    <SelectItem key={p.platform} value={p.platform}>{p.displayName}</SelectItem>
                   ))}
                 </SelectContent>
               </Select>
+              {selectedProvider && (
+                <ProviderHelperLinks provider={selectedProvider} className="mt-1" />
+              )}
             </div>
             {needsAccountId && (
               <div className="space-y-1.5">
@@ -284,9 +303,12 @@ export default function KeysPage() {
           ) : (
             <div className="space-y-6">
               {grouped.map(group => (
-                <div key={group.value}>
-                  <div className="flex items-baseline justify-between mb-2">
-                    <h3 className="text-sm font-medium">{group.label}</h3>
+                <div key={group.platform}>
+                  <div className="mb-2 flex items-start justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-medium">{group.displayName}</h3>
+                      <ProviderHelperLinks provider={group} className="mt-1" />
+                    </div>
                     <span className="text-xs text-muted-foreground tabular-nums">
                       {group.keys.length} key{group.keys.length === 1 ? '' : 's'}
                     </span>

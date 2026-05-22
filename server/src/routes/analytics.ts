@@ -19,6 +19,180 @@ function getSinceTimestamp(range: string): string {
   }
 }
 
+function parseBudget(value: string): number {
+  const match = value.match(/~?([\d.]+)(?:-([\d.]+))?([MK])?/);
+  if (!match) return 0;
+  const high = Number.parseFloat(match[2] ?? match[1]);
+  const unit = match[3] === 'M' ? 1_000_000 : match[3] === 'K' ? 1_000 : 1;
+  return Number.isFinite(high) ? high * unit : 0;
+}
+
+function formatTokens(value: number): string {
+  if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(1)}B`;
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  return String(Math.round(value));
+}
+
+function usagePercent(usedTokens: number, budget: number): number {
+  if (budget <= 0) return usedTokens > 0 ? 100 : 0;
+  return Math.min(999, Math.round((usedTokens / budget) * 100));
+}
+
+function usagePressure(percent: number): 'low' | 'medium' | 'high' | 'critical' {
+  if (percent >= 95) return 'critical';
+  if (percent >= 80) return 'high';
+  if (percent >= 50) return 'medium';
+  return 'low';
+}
+
+function usageText(usedTokens: number, budget: number, percent: number): string {
+  if (budget <= 0) return `${formatTokens(usedTokens)} used; no estimate configured`;
+  return `${formatTokens(usedTokens)} used of ${formatTokens(budget)} est/mo (${percent}%)`;
+}
+
+function isRealtimeSessionModel(modelId: string): boolean {
+  const normalized = modelId.toLowerCase();
+  return normalized.includes('native-audio') || normalized.includes('realtime');
+}
+
+// Text-ready estimated usage by provider/model. These estimates are based on
+// local requests routed through this app and catalog monthly-token budgets.
+analyticsRouter.get('/usage-estimates', (req: Request, res: Response) => {
+  const range = (req.query.range as string) ?? '7d';
+  const since = getSinceTimestamp(range);
+  const db = getDb();
+
+  const keyCounts = db.prepare(`
+    SELECT platform, COUNT(*) as count
+    FROM api_keys
+    WHERE enabled = 1 AND status != 'invalid'
+    GROUP BY platform
+  `).all() as { platform: string; count: number }[];
+  const keyCountMap = new Map(keyCounts.map(row => [row.platform, row.count]));
+
+  const modelBudgets = db.prepare(`
+    SELECT platform, model_id, display_name, monthly_token_budget
+    FROM models
+    WHERE enabled = 1
+  `).all() as { platform: string; model_id: string; display_name: string; monthly_token_budget: string }[];
+
+  const modelBudgetMap = new Map<string, {
+    platform: string;
+    modelId: string;
+    displayName: string;
+    estimatedMonthlyBudget: number;
+  }>();
+  const providerBudgetMap = new Map<string, number>();
+  const providerModelCountMap = new Map<string, number>();
+
+  for (const model of modelBudgets) {
+    const activeKeyCount = keyCountMap.get(model.platform) ?? 0;
+    const estimatedMonthlyBudget = parseBudget(model.monthly_token_budget) * activeKeyCount;
+    const key = `${model.platform}:${model.model_id}`;
+    modelBudgetMap.set(key, {
+      platform: model.platform,
+      modelId: model.model_id,
+      displayName: model.display_name,
+      estimatedMonthlyBudget,
+    });
+    providerBudgetMap.set(model.platform, (providerBudgetMap.get(model.platform) ?? 0) + estimatedMonthlyBudget);
+    if (estimatedMonthlyBudget > 0) {
+      providerModelCountMap.set(model.platform, (providerModelCountMap.get(model.platform) ?? 0) + 1);
+    }
+  }
+
+  const usageRows = db.prepare(`
+    SELECT
+      r.platform,
+      r.model_id,
+      COALESCE(m.display_name, r.model_id) as display_name,
+      COUNT(*) as requests,
+      COALESCE(SUM(r.input_tokens + r.output_tokens), 0) as used_tokens
+    FROM requests r
+    LEFT JOIN models m ON m.platform = r.platform AND m.model_id = r.model_id
+    WHERE r.created_at >= ?
+    GROUP BY r.platform, r.model_id
+  `).all(since) as { platform: string; model_id: string; display_name: string; requests: number; used_tokens: number }[];
+
+  const providerUsageMap = new Map<string, { requests: number; usedTokens: number }>();
+  const modelsByProvider = new Map<string, any[]>();
+
+  for (const row of usageRows) {
+    const key = `${row.platform}:${row.model_id}`;
+    const budget = modelBudgetMap.get(key)?.estimatedMonthlyBudget ?? 0;
+    const percent = usagePercent(row.used_tokens, budget);
+    const providerUsage = providerUsageMap.get(row.platform) ?? { requests: 0, usedTokens: 0 };
+    providerUsage.requests += row.requests;
+    providerUsage.usedTokens += row.used_tokens;
+    providerUsageMap.set(row.platform, providerUsage);
+
+    const modelEstimate = {
+      platform: row.platform,
+      modelId: row.model_id,
+      displayName: modelBudgetMap.get(key)?.displayName ?? row.display_name,
+      requests: row.requests,
+      usedTokens: row.used_tokens,
+      estimatedMonthlyBudget: budget,
+      usagePercent: percent,
+      pressure: usagePressure(percent),
+      usageText: usageText(row.used_tokens, budget, percent),
+      usageSource: isRealtimeSessionModel(row.model_id) ? 'session_mint' : 'local_tokens',
+    };
+    const models = modelsByProvider.get(row.platform) ?? [];
+    models.push(modelEstimate);
+    modelsByProvider.set(row.platform, models);
+  }
+
+  const providerNames = new Set<string>([
+    ...providerBudgetMap.keys(),
+    ...providerUsageMap.keys(),
+  ]);
+
+  const providers = Array.from(providerNames)
+    .map(platform => {
+      const usedTokens = providerUsageMap.get(platform)?.usedTokens ?? 0;
+      const requests = providerUsageMap.get(platform)?.requests ?? 0;
+      const estimatedMonthlyBudget = providerBudgetMap.get(platform) ?? 0;
+      const percent = usagePercent(usedTokens, estimatedMonthlyBudget);
+      const topModels = (modelsByProvider.get(platform) ?? [])
+        .sort((a, b) => b.usedTokens - a.usedTokens);
+
+      return {
+        platform,
+        requests,
+        activeKeyCount: keyCountMap.get(platform) ?? 0,
+        modelCount: providerModelCountMap.get(platform) ?? 0,
+        usedTokens,
+        estimatedMonthlyBudget,
+        usagePercent: percent,
+        pressure: usagePressure(percent),
+        usageText: usageText(usedTokens, estimatedMonthlyBudget, percent),
+        topModels,
+      };
+    })
+    .filter(row => row.usedTokens > 0 || row.estimatedMonthlyBudget > 0)
+    .sort((a, b) => b.usedTokens - a.usedTokens || b.estimatedMonthlyBudget - a.estimatedMonthlyBudget);
+
+  const totalUsed = providers.reduce((sum, provider) => sum + provider.usedTokens, 0);
+  const totalBudget = providers.reduce((sum, provider) => sum + provider.estimatedMonthlyBudget, 0);
+  const totalPercent = usagePercent(totalUsed, totalBudget);
+
+  res.json({
+    range,
+    generatedAt: new Date().toISOString(),
+    note: 'Estimated from requests routed through this app and catalog monthly-token budgets; external provider dashboard usage is not included. Direct realtime audio frames are counted only as session-mint requests unless routed through a server relay.',
+    total: {
+      usedTokens: totalUsed,
+      estimatedMonthlyBudget: totalBudget,
+      usagePercent: totalPercent,
+      pressure: usagePressure(totalPercent),
+      usageText: usageText(totalUsed, totalBudget, totalPercent),
+    },
+    providers,
+  });
+});
+
 // Summary stats
 analyticsRouter.get('/summary', (req: Request, res: Response) => {
   const range = (req.query.range as string) ?? '7d';

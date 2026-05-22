@@ -46,6 +46,7 @@ export function initDb(dbPath?: string): Database.Database {
   migrateModelsV9(db);
   migrateModelsV10(db);
   migrateModelsV11(db);
+  seedModelCapabilities(db);
   ensureUnifiedKey(db);
 
   console.log(`Database initialized at ${resolvedPath}`);
@@ -105,6 +106,26 @@ function createTables(db: Database.Database) {
       UNIQUE(model_db_id)
     );
 
+    CREATE TABLE IF NOT EXISTS model_capabilities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      model_db_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+      capability TEXT NOT NULL,
+      priority INTEGER NOT NULL DEFAULT 100,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      UNIQUE(model_db_id, capability)
+    );
+
+    CREATE TABLE IF NOT EXISTS model_runtime_health (
+      model_db_id INTEGER PRIMARY KEY REFERENCES models(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'healthy',
+      failure_count INTEGER NOT NULL DEFAULT 0,
+      last_error_category TEXT,
+      last_error TEXT,
+      last_failed_at TEXT,
+      last_success_at TEXT,
+      blocked_until TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -113,6 +134,8 @@ function createTables(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);
     CREATE INDEX IF NOT EXISTS idx_requests_platform ON requests(platform);
     CREATE INDEX IF NOT EXISTS idx_api_keys_platform ON api_keys(platform);
+    CREATE INDEX IF NOT EXISTS idx_model_capabilities_capability ON model_capabilities(capability, enabled);
+    CREATE INDEX IF NOT EXISTS idx_model_runtime_health_blocked ON model_runtime_health(blocked_until);
   `);
 }
 
@@ -924,6 +947,172 @@ function migrateModelsV11(db: Database.Database) {
       const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
       const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
       for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
+    }
+  });
+  apply();
+}
+
+function seedModelCapabilities(db: Database.Database) {
+  const addCapability = db.prepare(`
+    INSERT OR IGNORE INTO model_capabilities (model_db_id, capability, priority, enabled)
+    VALUES (?, ?, ?, ?)
+  `);
+
+  const chatModels = db.prepare(`
+    SELECT id, intelligence_rank, enabled
+    FROM models
+    WHERE lower(model_id) NOT LIKE '%embedding%'
+      AND lower(model_id) NOT LIKE '%embed%'
+      AND lower(model_id) NOT LIKE '%image%'
+      AND lower(model_id) NOT LIKE '%tts%'
+      AND lower(model_id) NOT LIKE '%whisper%'
+      AND lower(model_id) NOT LIKE '%live%'
+      AND lower(model_id) NOT LIKE '%native-audio%'
+  `).all() as { id: number; intelligence_rank: number; enabled: number }[];
+
+  const visionModels = db.prepare(`
+    SELECT id, intelligence_rank, enabled
+    FROM models
+    WHERE platform = 'google'
+      AND lower(model_id) LIKE 'gemini-%'
+      AND lower(model_id) NOT LIKE '%embedding%'
+      AND lower(model_id) NOT LIKE '%embed%'
+      AND lower(model_id) NOT LIKE '%image%'
+      AND lower(model_id) NOT LIKE '%tts%'
+      AND lower(model_id) NOT LIKE '%live%'
+      AND lower(model_id) NOT LIKE '%native-audio%'
+  `).all() as { id: number; intelligence_rank: number; enabled: number }[];
+
+  const insertCapabilityModel = db.prepare(`
+    INSERT OR IGNORE INTO models (
+      platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+      rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+  `);
+
+  const getModelId = db.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?');
+  const maxFallbackPriority = db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config');
+  const addFallback = db.prepare(`
+    INSERT OR IGNORE INTO fallback_config (model_db_id, priority, enabled)
+    VALUES (?, ?, 0)
+  `);
+
+  const embeddingModels: Array<[
+    string,
+    string,
+    string,
+    number,
+    number,
+    string,
+    number | null,
+    number | null,
+    number | null,
+    number | null,
+    string,
+    number | null,
+  ]> = [
+    // OpenRouter exposes /api/v1/embeddings and documents OpenAI embedding
+    // models with provider-prefixed IDs.
+    ['openrouter', 'openai/text-embedding-3-small', 'Text Embedding 3 Small (OpenRouter)', 90, 4, 'Embedding', null, null, null, null, 'embedding', 8191],
+    ['openrouter', 'openai/text-embedding-3-large', 'Text Embedding 3 Large (OpenRouter)', 91, 5, 'Embedding', null, null, null, null, 'embedding', 8191],
+    ['openrouter', 'qwen/qwen3-embedding-0.6b', 'Qwen3 Embedding 0.6B (OpenRouter)', 95, 4, 'Embedding', null, null, null, null, 'embedding', 32768],
+    // Mistral's /v1/embeddings endpoint supports mistral-embed.
+    ['mistral', 'mistral-embed', 'Mistral Embed', 92, 5, 'Embedding', null, null, null, null, 'embedding', 8192],
+  ];
+
+  const imageModels: Array<[
+    string,
+    string,
+    string,
+    number,
+    number,
+    string,
+    number | null,
+    number | null,
+    number | null,
+    number | null,
+    string,
+    number | null,
+  ]> = [
+    ['google', 'gemini-3.1-flash-image-preview', 'Gemini 3.1 Flash Image Preview', 40, 5, 'Image', 5, 20, 250000, null, 'image', 1048576],
+  ];
+
+  const audioModels: Array<[
+    string,
+    string,
+    string,
+    number,
+    number,
+    string,
+    number | null,
+    number | null,
+    number | null,
+    number | null,
+    string,
+    number | null,
+  ]> = [
+    ['google', 'gemini-2.5-flash-preview-tts', 'Gemini 2.5 Flash TTS', 50, 5, 'Audio', 5, 20, 250000, null, 'audio', 8192],
+    ['google', 'gemini-2.5-flash-native-audio-preview-12-2025', 'Gemini 2.5 Flash Native Audio Preview', 45, 2, 'Realtime Audio', 5, 20, 250000, null, 'audio', 32768],
+    ['groq', 'whisper-large-v3-turbo', 'Whisper Large V3 Turbo (Groq)', 51, 4, 'Audio', null, null, null, null, 'audio', 0],
+    ['groq', 'whisper-large-v3', 'Whisper Large V3 (Groq)', 52, 5, 'Audio', null, null, null, null, 'audio', 0],
+  ];
+
+  const audioRouteCapabilities: Array<[string, string, string, number]> = [
+    ['google', 'gemini-2.5-flash-preview-tts', 'speech', 1],
+    ['google', 'gemini-2.5-flash-native-audio-preview-12-2025', 'realtime_audio', 1],
+    ['groq', 'whisper-large-v3-turbo', 'transcription', 1],
+    ['groq', 'whisper-large-v3-turbo', 'translation', 1],
+    ['groq', 'whisper-large-v3', 'transcription', 2],
+    ['groq', 'whisper-large-v3', 'translation', 2],
+  ];
+
+  const apply = db.transaction(() => {
+    for (const model of chatModels) {
+      addCapability.run(model.id, 'chat', model.intelligence_rank, model.enabled);
+    }
+
+    for (const model of visionModels) {
+      addCapability.run(model.id, 'vision', model.intelligence_rank, model.enabled);
+    }
+
+    const fallbackBase = (maxFallbackPriority.get() as { mx: number }).mx;
+    for (let i = 0; i < embeddingModels.length; i++) {
+      const model = embeddingModels[i];
+      insertCapabilityModel.run(...model);
+      const row = getModelId.get(model[0], model[1]) as { id: number } | undefined;
+      if (row) {
+        addCapability.run(row.id, 'embeddings', i + 1, 1);
+        addFallback.run(row.id, fallbackBase + i + 1);
+      }
+    }
+
+    for (let i = 0; i < imageModels.length; i++) {
+      const model = imageModels[i];
+      insertCapabilityModel.run(...model);
+      const row = getModelId.get(model[0], model[1]) as { id: number } | undefined;
+      if (row) {
+        addCapability.run(row.id, 'images', i + 1, 1);
+        addCapability.run(row.id, 'image_generation', i + 1, 1);
+        addCapability.run(row.id, 'image_edit', i + 1, 1);
+        addCapability.run(row.id, 'image_variation', i + 1, 1);
+        addFallback.run(row.id, fallbackBase + embeddingModels.length + i + 1);
+      }
+    }
+
+    for (let i = 0; i < audioModels.length; i++) {
+      const model = audioModels[i];
+      insertCapabilityModel.run(...model);
+      const row = getModelId.get(model[0], model[1]) as { id: number } | undefined;
+      if (row) {
+        addCapability.run(row.id, 'audio', i + 1, 1);
+        addFallback.run(row.id, fallbackBase + embeddingModels.length + imageModels.length + i + 1);
+      }
+    }
+
+    for (const [platform, modelId, capability, priority] of audioRouteCapabilities) {
+      const row = getModelId.get(platform, modelId) as { id: number } | undefined;
+      if (row) addCapability.run(row.id, capability, priority, 1);
     }
   });
   apply();

@@ -8,11 +8,14 @@ import { modelsRouter } from './routes/models.js';
 import { proxyRouter } from './routes/proxy.js';
 import { fallbackRouter } from './routes/fallback.js';
 import { analyticsRouter } from './routes/analytics.js';
+import { logsRouter } from './routes/logs.js';
 import { healthRouter } from './routes/health.js';
 import { settingsRouter } from './routes/settings.js';
+import { modelSweepsRouter } from './routes/model-sweeps.js';
 import { errorHandler } from './middleware/errorHandler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const JSON_BODY_LIMIT = '25mb';
 
 export function createApp() {
   const app = express();
@@ -25,15 +28,20 @@ export function createApp() {
   // (which is also not a supported deployment — see README).
   app.use(helmet({ contentSecurityPolicy: false, hsts: false }));
   app.use(cors());
-  app.use(express.json({ limit: '1mb' }));
+  // Local vision requests can embed image data URLs in JSON. Keep this aligned
+  // with the multipart image/audio limit so local files work consistently.
+  app.use(express.json({ limit: JSON_BODY_LIMIT }));
+  app.use(express.urlencoded({ extended: true, limit: JSON_BODY_LIMIT }));
 
   // API routes
   app.use('/api/keys', keysRouter);
   app.use('/api/models', modelsRouter);
   app.use('/api/fallback', fallbackRouter);
   app.use('/api/analytics', analyticsRouter);
+  app.use('/api/logs', logsRouter);
   app.use('/api/health', healthRouter);
   app.use('/api/settings', settingsRouter);
+  app.use('/api/model-sweeps', modelSweepsRouter);
 
   // OpenAI-compatible proxy
   app.use('/v1', proxyRouter);

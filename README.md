@@ -1,16 +1,18 @@
 <div align="center">
 
-# FreeLLMAPI
+<img src="repo-assets/Header.png" alt="FreeLLMAPI Pro Max header showing multimodal capabilities, routing, providers, and token budget" width="100%" />
 
-**One OpenAI-compatible endpoint. Eleven free LLM providers. ~1B+ tokens per month.**
+# FreeLLMAPI Pro Max
 
-Aggregate the free tiers from Google, Groq, Cerebras, SambaNova, NVIDIA, Mistral, OpenRouter, GitHub Models, Cohere, Cloudflare, and Z.ai (Zhipu) behind a single `/v1/chat/completions` endpoint. Keys are stored encrypted. A router picks the best available model for each request, falls over to the next provider when one is rate-limited, and tracks per-key usage so you stay under every free-tier cap.
+**One OpenAI-compatible endpoint. Fifteen provider routes. Multimodal Pro Max dashboard. ~1B+ tokens per month.**
+
+FreeLLMAPI Pro Max is this fork's upgraded personal edition of the original FreeLLMAPI project. It keeps the local free-tier router idea, then layers on multimodal endpoints, capability testing, model quarantine, richer analytics, integrations, and realtime voice UI.
+
+Aggregate free and free-friendly tiers from Google, Groq, Cerebras, SambaNova, NVIDIA, Mistral, OpenRouter, GitHub Models, Cohere, Cloudflare, Z.ai (Zhipu), Ollama Cloud, Kilo Gateway, Pollinations, and LLM7 behind a unified local `/v1` API. Keys are stored encrypted. A router picks the best available model for each request, falls over to the next provider when one is rate-limited, and tracks per-key usage so you stay under every free-tier cap.
 
 [![CI](https://github.com/tashfeenahmed/freellmapi/actions/workflows/ci.yml/badge.svg)](https://github.com/tashfeenahmed/freellmapi/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
-
-![Fallback chain with per-provider token budget](repo-assets/fallback-chain.png)
 
 </div>
 
@@ -35,7 +37,7 @@ Aggregate the free tiers from Google, Groq, Cerebras, SambaNova, NVIDIA, Mistral
 
 Every serious AI lab now offers a free tier — a few million tokens a month, a few thousand requests a day. On its own each tier is a toy. Stacked together, they add up to roughly **1.3 billion tokens per month** of working inference capacity, across dozens of models from small-and-fast to reasonably capable.
 
-The problem is that stacking them by hand is painful: fourteen different SDKs, fourteen different rate limits, fourteen places a request can fail. FreeLLMAPI collapses that into one OpenAI-compatible endpoint. Point any OpenAI client library at your local server, and it routes transparently across whichever providers you've added keys for.
+The problem is that stacking them by hand is painful: many SDKs, many rate limits, and many places a request can fail. FreeLLMAPI Pro Max collapses that into one OpenAI-compatible endpoint. Point any OpenAI client library at your local server, and it routes transparently across whichever providers you've added keys for.
 
 ## Supported providers
 
@@ -56,6 +58,12 @@ The problem is that stacking them by hand is painful: fourteen different SDKs, f
 <td align="center"><a href="https://cohere.com"><b>Cohere</b><br/>Command R+ · Command-A (trial)</a></td>
 <td align="center"><a href="https://docs.z.ai"><b>Z.ai (Zhipu)</b><br/>GLM-4.5 · GLM-4.7 Flash</a></td>
 <td align="center"><a href="https://build.nvidia.com"><b>NVIDIA</b><br/>NIM (disabled by default)</a></td>
+<td align="center"><a href="https://ollama.com"><b>Ollama Cloud</b><br/>Free cloud models</a></td>
+</tr>
+<tr>
+<td align="center"><a href="https://kilo.ai/docs/gateway"><b>Kilo Gateway</b><br/>OpenAI-compatible gateway</a></td>
+<td align="center"><a href="https://pollinations.ai"><b>Pollinations</b><br/>Anonymous OpenAI-compatible text</a></td>
+<td align="center"><a href="https://llm7.io"><b>LLM7</b><br/>Anonymous / token gateway</a></td>
 <td align="center"><i>Adding another? See <a href="#contributing">Contributing</a>.</i></td>
 </tr>
 </table>
@@ -63,6 +71,12 @@ The problem is that stacking them by hand is painful: fourteen different SDKs, f
 ## Features
 
 - **OpenAI-compatible** — `POST /v1/chat/completions` and `GET /v1/models` work with the official OpenAI SDKs and any OpenAI-compatible client (LangChain, LlamaIndex, Continue, Hermes, etc.). Just change `base_url`.
+- **Embeddings** — `POST /v1/embeddings` routes across configured embedding-capable providers and returns OpenAI-compatible embedding responses.
+- **Vision chat** — OpenAI-style `content` arrays with `text` and `image_url` parts route to configured vision-capable providers. The first provider path supports Google Gemini with `data:image/...;base64,...` and safe remote `http(s)` image URLs.
+- **Image generation, edits, and variations** — `POST /v1/images/generations`, `/v1/images/edits`, and `/v1/images/variations` route to configured image-capable providers and return OpenAI-compatible image data. The first provider path supports Google Gemini image models.
+- **Speech generation** — `POST /v1/audio/speech` routes text-to-speech requests to configured audio-capable providers. The first provider path supports Google Gemini TTS and returns WAV or PCM audio.
+- **Audio transcription and translation** — `POST /v1/audio/transcriptions` and `/v1/audio/translations` accept OpenAI-style multipart uploads and route to configured audio-capable providers. The first provider path supports Groq Whisper models.
+- **Realtime audio sessions (beta)** — `POST /v1/realtime/sessions` mints a short-lived Gemini Live session token and constrained WebSocket URL so trusted clients can run realtime audio without seeing your long-lived Google API key.
 - **Streaming and non-streaming** — Server-Sent Events for `stream: true`, JSON response otherwise. Every provider adapter implements both.
 - **Tool calling** — OpenAI-style `tools` / `tool_choice` requests are passed through, and assistant `tool_calls` + `tool` role follow-up messages round-trip across providers.
 - **Automatic fallover** — If the chosen provider returns a 429, 5xx, or times out, the router skips it, puts the key on a short cooldown, and retries on the next model in your fallback chain (up to 20 attempts).
@@ -71,18 +85,19 @@ The problem is that stacking them by hand is painful: fourteen different SDKs, f
 - **Encrypted key storage** — API keys are encrypted with AES-256-GCM before hitting SQLite; decryption happens in-memory just before a request.
 - **Unified API key** — Clients authenticate to your proxy with a single `freellmapi-…` bearer token. You never expose upstream provider keys to your apps.
 - **Health checks** — Periodic probes mark keys as `healthy`, `rate_limited`, `invalid`, or `error` so the router skips dead ones automatically.
-- **Admin dashboard** — React + Vite UI to manage keys, reorder the fallback chain, inspect analytics, and run prompts in a playground. Dark mode included.
+- **Admin dashboard** — React + Vite UI to manage keys, reorder the fallback chain, inspect analytics, test every capability from the Playground, and copy SDK snippets from the Integrations page. Dark mode included.
 - **Analytics** — Per-request logging with latency, token counts, success rate, and per-provider breakdowns.
+- **Capability matrix** — Dashboard lights show which providers can serve chat, embeddings, vision, images, and audio, whether a key is configured, and direct docs/key links for each provider.
+- **Integrations guide** — Copy-ready JavaScript, Python, and cURL snippets show how to call every supported endpoint with the local `/v1` base URL and unified API key.
+- **Logs diagnostics** — Dedicated dashboard tab for recent API logs, error flags, provider ranking, key health, and actionable routing recommendations.
 - **Deploys to a Raspberry Pi** — Runs happily on a Pi 4 under PM2 behind nginx. ~40 MB RSS at idle.
 
 ## Not yet supported
 
 The scope is deliberately narrow. If a feature isn't on this list and isn't below, assume it isn't there yet.
 
-- **Embeddings** (`/v1/embeddings`)
-- **Image generation** (`/v1/images/*`)
-- **Audio / speech** (`/v1/audio/*`)
-- **Vision / multimodal inputs** — message content is text-only
+- **Server-side realtime WebSocket relay** — the dashboard can mint and use Gemini Live sessions locally, but a provider-agnostic relay with normalized realtime events is not implemented yet
+- **Speech formats beyond WAV/PCM** — Gemini TTS returns PCM; this proxy wraps it as WAV by default
 - **Legacy completions** (`/v1/completions`) — only the chat endpoint is implemented
 - **Moderation** (`/v1/moderations`)
 - **`n > 1`** (multiple completions per request)
@@ -107,7 +122,7 @@ echo "ENCRYPTION_KEY=$(node -e "console.log(require('crypto').randomBytes(32).to
 npm run dev
 ```
 
-Open http://localhost:5173 (the Vite dev UI), add your provider keys on the **Keys** page, reorder the **Fallback Chain** to taste, and grab your unified API key from the **Keys** page header. That unified key is what you point your OpenAI SDK at.
+Open http://localhost:5173 (the Vite dev UI), add your provider keys on the **Keys** page, reorder the **Fallback Chain** to taste, and grab your unified API key from the **Keys** page header. That unified key is what you point your OpenAI SDK at. The **Integrations** page shows copyable SDK and cURL snippets for every capability.
 
 For a production build:
 
@@ -118,7 +133,7 @@ node server/dist/index.js     # server + dashboard both served on :3001
 
 ## Using the API
 
-Any OpenAI-compatible client works. Examples:
+Any OpenAI-compatible client works. For copy-button examples in JavaScript, Python, and cURL, open the dashboard's **Integrations** tab. Examples:
 
 **Python**
 
@@ -161,6 +176,106 @@ stream = client.chat.completions.create(
 for chunk in stream:
     print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
+
+**Embeddings**
+
+```python
+embedding = client.embeddings.create(
+    model="auto",
+    input=["FreeLLMAPI routes embeddings too."],
+)
+print(len(embedding.data[0].embedding))
+print("Routed via:", embedding.response.headers.get("x-routed-via"))
+```
+
+**Image generation**
+
+```python
+image = client.images.generate(
+    model="auto",
+    prompt="A clean app icon with a white dot on a black background",
+    size="1024x1024",
+    response_format="b64_json",
+)
+print(image.data[0].b64_json[:40])
+```
+
+**Image edit**
+
+```python
+edited = client.images.edit(
+    model="auto",
+    image=open("source.png", "rb"),
+    prompt="Replace the background with a clean white studio backdrop",
+    response_format="b64_json",
+)
+print(edited.data[0].b64_json[:40])
+```
+
+**Image variation**
+
+```python
+variation = client.images.create_variation(
+    model="auto",
+    image=open("source.png", "rb"),
+    response_format="b64_json",
+)
+print(variation.data[0].b64_json[:40])
+```
+
+**Speech generation**
+
+```python
+speech = client.audio.speech.create(
+    model="auto",
+    voice="alloy",
+    input="FreeLLMAPI can route speech generation too.",
+    response_format="wav",
+)
+Path("speech.wav").write_bytes(speech.content)
+```
+
+**Audio transcription**
+
+```python
+with open("meeting.wav", "rb") as audio:
+    transcript = client.audio.transcriptions.create(
+        model="auto",
+        file=audio,
+        response_format="json",
+    )
+print(transcript.text)
+```
+
+**Audio translation**
+
+```python
+with open("meeting.wav", "rb") as audio:
+    translation = client.audio.translations.create(
+        model="auto",
+        file=audio,
+        response_format="json",
+    )
+print(translation.text)
+```
+
+**Realtime audio session (beta)**
+
+```bash
+curl http://localhost:3001/v1/realtime/sessions \
+  -H "Authorization: Bearer freellmapi-your-unified-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "instructions": "You are concise.",
+    "voice": "alloy",
+    "response_modalities": ["AUDIO"],
+    "input_audio_transcription": true,
+    "output_audio_transcription": true
+  }'
+```
+
+Use the returned `client_secret.value` and `connect_url` from a trusted client to open the Gemini Live WebSocket session. The long-lived Google API key stays encrypted in FreeLLMAPI.
 
 **Tool calling**
 
@@ -212,19 +327,49 @@ Every response carries an `X-Routed-Via: <platform>/<model>` header so you can s
 
 Manage provider credentials and grab the unified API key your apps connect with. Each key shows a status dot and when it was last health-checked.
 
-![Keys page](repo-assets/keys.png)
-
 ### Playground
 
-Send a chat completion through the router and see which provider served it, with the model ID and latency printed right on the message.
+Use the **Chat** tab as a live workspace for chat, vision with URL or local image selection, embeddings, image/audio actions, speech playback, and realtime voice sessions. Switch to **Test Lab** for endpoint diagnostics, raw JSON inspection, and the all-model sweep/quarantine flow.
 
-![Playground page](repo-assets/playground.png)
+![Playground chat workspace](repo-assets/playground-chat.png)
+
+![Playground speech generation](repo-assets/playground-speech.png)
+
+![Playground realtime listening state](repo-assets/playground-realtime-listening.png)
+
+![Playground realtime talking state](repo-assets/playground-realtime-talking.png)
+
+![Playground Test Lab model sweep](repo-assets/playground-test-lab-sweep.png)
+
+### Integrations
+
+Copy the local `/v1` base URL, unified API key, client bootstrap code, and per-capability snippets for chat, vision, embeddings, images, audio, and realtime sessions.
+
+### Fallback
+
+Review monthly token budgets, model health, system quarantines, and manual fallback disables before routing live traffic.
+
+![Fallback model health and quarantine view](repo-assets/fallback-model-health.png)
+
+### Capabilities
+
+Provider support lights show which configured keys can serve chat, embeddings, vision, images, and audio.
+
+![Capabilities matrix](repo-assets/capabilities-matrix.png)
+
+### Logs
+
+The Logs page combines provider ranking, diagnosis flags, recommendations, and recent API events.
+
+![Logs diagnostics dashboard](repo-assets/logs-diagnostics.png)
+
+![Recent API logs](repo-assets/logs-recent-events.png)
 
 ### Analytics
 
-Request volume, success rate, tokens in and out, average latency, and per-provider breakdowns over 24h / 7d / 30d windows.
+Request volume, success rate, tokens in and out, average latency, estimated savings, and per-provider usage estimates over 24h / 7d / 30d windows.
 
-![Analytics page](repo-assets/analytics.png)
+![Analytics usage estimates](repo-assets/analytics-usage.png)
 
 ## How it works
 

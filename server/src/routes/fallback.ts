@@ -1,10 +1,20 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
+import type { Platform } from '@freellmapi/shared/types.js';
 import { getDb } from '../db/index.js';
-import { getAllPenalties } from '../services/router.js';
+import { clearModelRuntimeHealth, getAllPenalties, getModelRuntimeHealth } from '../services/router.js';
+import { PROVIDER_METADATA } from '../lib/provider-metadata.js';
 
 export const fallbackRouter = Router();
+
+function parseBudget(s: string): number {
+  const m = s.match(/~?([\d.]+)(?:-([\d.]+))?([MK])?/);
+  if (!m) return 0;
+  const high = parseFloat(m[2] ?? m[1]);
+  const unit = m[3] === 'M' ? 1_000_000 : m[3] === 'K' ? 1_000 : 1;
+  return high * unit;
+}
 
 // Get fallback chain (with dynamic penalties)
 fallbackRouter.get('/', (_req: Request, res: Response) => {
@@ -16,13 +26,23 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
            m.monthly_token_budget
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
+    LEFT JOIN model_capabilities mc
+      ON mc.model_db_id = m.id
+      AND mc.capability = 'chat'
+      AND mc.enabled = 1
+    WHERE mc.id IS NOT NULL
+       OR NOT EXISTS (
+         SELECT 1 FROM model_capabilities any_mc
+         WHERE any_mc.model_db_id = m.id
+       )
     ORDER BY fc.priority ASC
   `).all() as any[];
 
   // Count enabled keys per platform
   const keyCounts = db.prepare(`
     SELECT platform, COUNT(*) as count
-    FROM api_keys WHERE enabled = 1
+    FROM api_keys
+    WHERE enabled = 1 AND status != 'invalid'
     GROUP BY platform
   `).all() as { platform: string; count: number }[];
   const keyCountMap = new Map(keyCounts.map(k => [k.platform, k.count]));
@@ -30,9 +50,16 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
   // Get current dynamic penalties
   const penalties = getAllPenalties();
   const penaltyMap = new Map(penalties.map(p => [p.modelDbId, p]));
+  const runtimeHealth = getModelRuntimeHealth();
+  const runtimeHealthMap = new Map(runtimeHealth.map(h => [h.modelDbId, h]));
 
   res.json(rows.map(r => {
     const penalty = penaltyMap.get(r.model_db_id);
+    const health = runtimeHealthMap.get(r.model_db_id);
+    const keyCount = keyCountMap.get(r.platform) ?? 0;
+    const baseBudget = parseBudget(r.monthly_token_budget);
+    const effectiveBudget = baseBudget * keyCount;
+
     return {
       modelDbId: r.model_db_id,
       priority: r.priority,
@@ -41,6 +68,7 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
       rateLimitHits: penalty?.count ?? 0,
       enabled: r.enabled === 1,
       platform: r.platform,
+      providerDisplayName: PROVIDER_METADATA[r.platform as Platform]?.displayName ?? r.platform,
       modelId: r.model_id,
       displayName: r.display_name,
       intelligenceRank: r.intelligence_rank,
@@ -49,7 +77,15 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
       rpmLimit: r.rpm_limit,
       rpdLimit: r.rpd_limit,
       monthlyTokenBudget: r.monthly_token_budget,
-      keyCount: keyCountMap.get(r.platform) ?? 0,
+      baseBudget,
+      effectiveBudget,
+      keyCount,
+      runtimeStatus: health?.status ?? 'healthy',
+      runtimeBlockedUntil: health?.blockedUntil ?? null,
+      lastErrorCategory: health?.lastErrorCategory ?? null,
+      lastError: health?.lastError ?? null,
+      failureCount: health?.failureCount ?? 0,
+      requiresConfirmation: health?.lastErrorCategory === 'zero_quota',
     };
   }));
 });
@@ -59,6 +95,14 @@ const updateSchema = z.array(z.object({
   priority: z.number(),
   enabled: z.boolean(),
 }));
+
+const toggleSchema = z.object({
+  enabled: z.boolean(),
+});
+
+const retrySchema = z.object({
+  confirm: z.boolean().optional(),
+});
 
 // Update fallback chain (full replace)
 fallbackRouter.put('/', (req: Request, res: Response) => {
@@ -81,6 +125,90 @@ fallbackRouter.put('/', (req: Request, res: Response) => {
   updateAll();
 
   res.json({ success: true });
+});
+
+fallbackRouter.patch('/:modelDbId', (req: Request, res: Response) => {
+  const modelDbId = Number(req.params.modelDbId);
+  if (!Number.isInteger(modelDbId) || modelDbId <= 0) {
+    res.status(400).json({ error: { message: 'Invalid model ID' } });
+    return;
+  }
+
+  const parsed = toggleSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    return;
+  }
+
+  const db = getDb();
+  const result = db.prepare(`
+    UPDATE fallback_config SET enabled = ? WHERE model_db_id = ?
+  `).run(parsed.data.enabled ? 1 : 0, modelDbId);
+
+  if (result.changes === 0) {
+    res.status(404).json({ error: { message: 'Fallback model not found' } });
+    return;
+  }
+
+  res.json({ success: true, modelDbId, enabled: parsed.data.enabled });
+});
+
+fallbackRouter.post('/:modelDbId/retry', (req: Request, res: Response) => {
+  const modelDbId = Number(req.params.modelDbId);
+  if (!Number.isInteger(modelDbId) || modelDbId <= 0) {
+    res.status(400).json({ error: { message: 'Invalid model ID' } });
+    return;
+  }
+
+  const parsed = retrySchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    return;
+  }
+
+  const db = getDb();
+  const row = db.prepare(`
+    SELECT m.id, m.model_id, m.platform
+    FROM models m
+    JOIN fallback_config fc ON fc.model_db_id = m.id
+    WHERE m.id = ?
+  `).get(modelDbId) as { id: number; model_id: string; platform: string } | undefined;
+
+  if (!row) {
+    res.status(404).json({ error: { message: 'Fallback model not found' } });
+    return;
+  }
+
+  const health = db.prepare(`
+    SELECT last_error_category
+    FROM model_runtime_health
+    WHERE model_db_id = ?
+  `).get(modelDbId) as { last_error_category: string | null } | undefined;
+  const requiresConfirmation = health?.last_error_category === 'zero_quota';
+
+  if (requiresConfirmation && parsed.data.confirm !== true) {
+    res.status(409).json({
+      error: {
+        message: 'This model was quarantined because the provider reported zero quota. Confirm before enabling it again.',
+        type: 'confirmation_required',
+        code: 'confirmation_required',
+      },
+      requiresConfirmation: true,
+      modelDbId,
+      platform: row.platform,
+      modelId: row.model_id,
+    });
+    return;
+  }
+
+  clearModelRuntimeHealth(modelDbId);
+  res.json({
+    success: true,
+    modelDbId,
+    platform: row.platform,
+    modelId: row.model_id,
+    runtimeStatus: 'healthy',
+  });
 });
 
 // Sort presets — `orderBy` is selected from a fixed whitelist, never from
@@ -121,9 +249,17 @@ fallbackRouter.get('/token-usage', (_req: Request, res: Response) => {
   const platforms = db.prepare(`
     SELECT DISTINCT ak.platform
     FROM api_keys ak
-    WHERE ak.enabled = 1
+    WHERE ak.enabled = 1 AND ak.status != 'invalid'
   `).all() as { platform: string }[];
   const platformSet = new Set(platforms.map(p => p.platform));
+
+  const keyCounts = db.prepare(`
+    SELECT platform, COUNT(*) as count
+    FROM api_keys
+    WHERE enabled = 1 AND status != 'invalid'
+    GROUP BY platform
+  `).all() as { platform: string; count: number }[];
+  const keyCountMap = new Map(keyCounts.map(k => [k.platform, k.count]));
 
   // Get monthly budget per model, ordered by fallback priority
   const models = db.prepare(`
@@ -131,28 +267,41 @@ fallbackRouter.get('/token-usage', (_req: Request, res: Response) => {
            fc.priority
     FROM models m
     JOIN fallback_config fc ON fc.model_db_id = m.id
+    LEFT JOIN model_capabilities mc
+      ON mc.model_db_id = m.id
+      AND mc.capability = 'chat'
+      AND mc.enabled = 1
     WHERE m.enabled = 1
+      AND (
+        mc.id IS NOT NULL
+        OR NOT EXISTS (
+          SELECT 1 FROM model_capabilities any_mc
+          WHERE any_mc.model_db_id = m.id
+        )
+      )
     ORDER BY fc.priority ASC
   `).all() as { platform: string; model_id: string; display_name: string; monthly_token_budget: string; priority: number }[];
-
-  function parseBudget(s: string): number {
-    const m = s.match(/~?([\d.]+)(?:-([\d.]+))?([MK])?/);
-    if (!m) return 0;
-    const high = parseFloat(m[2] ?? m[1]);
-    const unit = m[3] === 'M' ? 1_000_000 : m[3] === 'K' ? 1_000 : 1;
-    return high * unit;
-  }
 
   // Build per-model breakdown (only platforms with keys)
   const modelBudgets = models
     .filter(m => platformSet.has(m.platform))
-    .map(m => ({
-      displayName: m.display_name,
-      platform: m.platform,
-      budget: parseBudget(m.monthly_token_budget),
-    }));
+    .map(m => {
+      const keyCount = keyCountMap.get(m.platform) ?? 0;
+      const baseBudget = parseBudget(m.monthly_token_budget);
+      const effectiveBudget = baseBudget * keyCount;
 
-  const totalBudget = modelBudgets.reduce((s, m) => s + m.budget, 0);
+      return {
+        displayName: m.display_name,
+        platform: m.platform,
+        monthlyTokenBudget: m.monthly_token_budget,
+        baseBudget,
+        keyCount,
+        effectiveBudget,
+        budget: effectiveBudget,
+      };
+    });
+
+  const totalBudget = modelBudgets.reduce((s, m) => s + m.effectiveBudget, 0);
 
   // Tokens used this month
   const usage = db.prepare(`

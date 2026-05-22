@@ -2,6 +2,12 @@ import type {
   ChatMessage,
   ChatCompletionResponse,
   ChatCompletionChunk,
+  AudioTextResult,
+  AudioTranscriptionRequest,
+  AudioTranslationRequest,
+  EmbeddingInput,
+  EmbeddingOptions,
+  EmbeddingResponse,
   Platform,
 } from '@freellmapi/shared/types.js';
 import { BaseProvider, type CompletionOptions } from './base.js';
@@ -69,6 +75,7 @@ export class OpenAICompatProvider extends BaseProvider {
     }
 
     const data = await res.json() as ChatCompletionResponse;
+    throwIfOpenAIErrorBody(this.name, data);
     normalizeChoices(data);
     data._routed_via = { platform: this.platform, model: modelId };
     return data;
@@ -124,13 +131,67 @@ export class OpenAICompatProvider extends BaseProvider {
         if (!trimmed || !trimmed.startsWith('data: ')) continue;
         const data = trimmed.slice(6);
         if (data === '[DONE]') return;
+        let chunk: ChatCompletionChunk;
         try {
-          yield JSON.parse(data) as ChatCompletionChunk;
+          chunk = JSON.parse(data) as ChatCompletionChunk;
         } catch {
-          // Skip malformed chunks
+          // Skip malformed chunks, but do not silently swallow provider error chunks.
+          if (data.includes('"error"')) throw new Error(`${this.name} API error: provider returned an unreadable error chunk`);
+          continue;
         }
+        throwIfOpenAIErrorBody(this.name, chunk);
+        yield chunk;
       }
     }
+  }
+
+  async createEmbedding(
+    apiKey: string,
+    input: EmbeddingInput,
+    modelId: string,
+    options?: EmbeddingOptions,
+  ): Promise<EmbeddingResponse> {
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/embeddings`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        ...this.extraHeaders,
+      },
+      body: JSON.stringify({
+        model: modelId,
+        input,
+        encoding_format: options?.encoding_format,
+        dimensions: options?.dimensions,
+        user: options?.user,
+      }),
+    }, this.timeoutMs);
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(`${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+    }
+
+    const data = await res.json() as EmbeddingResponse;
+    throwIfOpenAIErrorBody(this.name, data);
+    data._routed_via = { platform: this.platform, model: modelId };
+    return data;
+  }
+
+  async transcribeAudio(
+    apiKey: string,
+    request: AudioTranscriptionRequest,
+    modelId: string,
+  ): Promise<AudioTextResult> {
+    return this.forwardAudioText(apiKey, request, modelId, 'transcriptions');
+  }
+
+  async translateAudio(
+    apiKey: string,
+    request: AudioTranslationRequest,
+    modelId: string,
+  ): Promise<AudioTextResult> {
+    return this.forwardAudioText(apiKey, request, modelId, 'translations');
   }
 
   async validateKey(apiKey: string): Promise<boolean> {
@@ -147,6 +208,90 @@ export class OpenAICompatProvider extends BaseProvider {
     }, 10000);
     return res.status !== 401 && res.status !== 403;
   }
+
+  private async forwardAudioText(
+    apiKey: string,
+    request: AudioTranscriptionRequest | AudioTranslationRequest,
+    modelId: string,
+    endpoint: 'transcriptions' | 'translations',
+  ): Promise<AudioTextResult> {
+    const form = buildAudioFormData(request, modelId);
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/audio/${endpoint}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        ...this.extraHeaders,
+      },
+      body: form,
+    }, this.timeoutMs);
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(`${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+    }
+
+    const contentType = res.headers.get('content-type') ?? 'application/json';
+    const body = contentType.includes('application/json')
+      ? await res.json()
+      : await res.text();
+    if (contentType.includes('application/json')) {
+      throwIfOpenAIErrorBody(this.name, body);
+    }
+
+    return {
+      body,
+      contentType,
+      _routed_via: { platform: this.platform, model: modelId },
+    };
+  }
+}
+
+function throwIfOpenAIErrorBody(providerName: string, data: unknown): void {
+  if (!data || typeof data !== 'object' || !('error' in data)) return;
+
+  const error = (data as { error?: unknown }).error;
+  if (!error) return;
+
+  if (typeof error === 'string') {
+    throw new Error(`${providerName} API error: ${error}`);
+  }
+
+  if (typeof error === 'object') {
+    const body = error as { message?: unknown; code?: unknown; type?: unknown };
+    const message = typeof body.message === 'string' ? body.message : 'Provider returned error';
+    const code = typeof body.code === 'number' || typeof body.code === 'string' ? ` ${body.code}` : '';
+    throw new Error(`${providerName} API error${code}: ${message}`);
+  }
+
+  throw new Error(`${providerName} API error: Provider returned error`);
+}
+
+function buildAudioFormData(
+  request: AudioTranscriptionRequest | AudioTranslationRequest,
+  modelId: string,
+): FormData {
+  const form = new FormData();
+  form.set('model', modelId);
+
+  if (request.file) {
+    const blob = new Blob([request.file.data], {
+      type: request.file.contentType || 'application/octet-stream',
+    });
+    form.set('file', blob, request.file.filename || 'audio');
+  }
+
+  if (request.url) form.set('url', request.url);
+  if ('language' in request && request.language) form.set('language', request.language);
+  if (request.prompt) form.set('prompt', request.prompt);
+  if (request.response_format) form.set('response_format', request.response_format);
+  if (typeof request.temperature === 'number') form.set('temperature', String(request.temperature));
+  if ('timestamp_granularities' in request && request.timestamp_granularities) {
+    for (const granularity of request.timestamp_granularities) {
+      form.append('timestamp_granularities[]', granularity);
+    }
+  }
+
+  return form;
 }
 
 /**

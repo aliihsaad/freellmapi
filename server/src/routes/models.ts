@@ -1,9 +1,68 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
+import type { CapabilitiesResponse, ModelCapability, Platform, ProvidersResponse } from '@freellmapi/shared/types.js';
 import { getDb } from '../db/index.js';
 import { hasProvider } from '../providers/index.js';
+import { getProviderMetadata, listProviderMetadata, PLATFORM_ORDER } from '../lib/provider-metadata.js';
 
 export const modelsRouter = Router();
+
+const CAPABILITIES: ModelCapability[] = ['chat', 'embeddings', 'vision', 'images', 'audio'];
+
+modelsRouter.get('/providers', (_req: Request, res: Response) => {
+  const result: ProvidersResponse = {
+    providers: listProviderMetadata(),
+  };
+
+  res.json(result);
+});
+
+modelsRouter.get('/capabilities', (_req: Request, res: Response) => {
+  const db = getDb();
+
+  const keyCounts = db.prepare(`
+    SELECT platform, COUNT(*) as count
+    FROM api_keys
+    WHERE enabled = 1 AND status != 'invalid'
+    GROUP BY platform
+  `).all() as { platform: Platform; count: number }[];
+
+  const capabilityCounts = db.prepare(`
+    SELECT m.platform, mc.capability, COUNT(*) as supported_models
+    FROM model_capabilities mc
+    JOIN models m ON m.id = mc.model_db_id
+    WHERE m.enabled = 1 AND mc.enabled = 1
+    GROUP BY m.platform, mc.capability
+  `).all() as { platform: Platform; capability: ModelCapability; supported_models: number }[];
+
+  const keyCountMap = new Map(keyCounts.map(k => [k.platform, k.count]));
+  const supportMap = new Map(
+    capabilityCounts.map(c => [`${c.platform}:${c.capability}`, c.supported_models]),
+  );
+
+  const result: CapabilitiesResponse = {
+    capabilities: CAPABILITIES,
+    providers: PLATFORM_ORDER.map(platform => {
+      const keyCount = keyCountMap.get(platform) ?? 0;
+      const capabilities = Object.fromEntries(
+        CAPABILITIES.map(capability => {
+          const supportedModels = supportMap.get(`${platform}:${capability}`) ?? 0;
+          const configured = supportedModels > 0 && keyCount > 0;
+          const status = configured
+            ? 'configured'
+            : supportedModels > 0
+              ? 'missing_key'
+              : 'unsupported';
+          return [capability, { supportedModels, configured, status }];
+        }),
+      ) as CapabilitiesResponse['providers'][number]['capabilities'];
+
+      return { ...getProviderMetadata(platform), keyCount, capabilities };
+    }),
+  };
+
+  res.json(result);
+});
 
 // List all models with availability info
 modelsRouter.get('/', (_req: Request, res: Response) => {
@@ -19,7 +78,7 @@ modelsRouter.get('/', (_req: Request, res: Response) => {
   const keyCounts = db.prepare(`
     SELECT platform, COUNT(*) as count
     FROM api_keys
-    WHERE enabled = 1
+    WHERE enabled = 1 AND status != 'invalid'
     GROUP BY platform
   `).all() as { platform: string; count: number }[];
 

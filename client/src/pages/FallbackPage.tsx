@@ -30,6 +30,7 @@ interface FallbackEntry {
   rateLimitHits: number
   enabled: boolean
   platform: string
+  providerDisplayName: string
   modelId: string
   displayName: string
   intelligenceRank: number
@@ -38,7 +39,15 @@ interface FallbackEntry {
   rpmLimit: number | null
   rpdLimit: number | null
   monthlyTokenBudget: string
+  baseBudget: number
+  effectiveBudget: number
   keyCount: number
+  runtimeStatus: 'healthy' | 'degraded' | 'unavailable'
+  runtimeBlockedUntil: string | null
+  lastErrorCategory: string | null
+  lastError: string | null
+  failureCount: number
+  requiresConfirmation: boolean
 }
 
 function formatTokens(n: number): string {
@@ -51,7 +60,15 @@ function formatTokens(n: number): string {
 interface TokenUsageData {
   totalBudget: number
   totalUsed: number
-  models: { displayName: string; platform: string; budget: number }[]
+  models: {
+    displayName: string
+    platform: string
+    monthlyTokenBudget: string
+    baseBudget: number
+    keyCount: number
+    effectiveBudget: number
+    budget: number
+  }[]
 }
 
 const platformColors: Record<string, string> = {
@@ -72,6 +89,160 @@ const platformColors: Record<string, string> = {
   llm7:        '#0ea5e9',
 }
 
+function formatBudgetLabel(monthlyTokenBudget: string, keyCount: number, effectiveBudget: number): string {
+  const base = `${monthlyTokenBudget} tok/mo`
+  if (keyCount > 1 && effectiveBudget > 0) return `${base} x ${keyCount} keys = ${formatTokens(effectiveBudget)}`
+  if (keyCount > 1) return `${base} x ${keyCount} keys`
+  return base
+}
+
+function formatRuntimeStatus(entry: FallbackEntry): string | null {
+  if (entry.runtimeStatus === 'healthy' && !entry.runtimeBlockedUntil) return null
+  if (entry.runtimeStatus === 'unavailable') return 'Unavailable'
+  if (entry.runtimeBlockedUntil) return 'Cooling down'
+  return 'Degraded'
+}
+
+function formatHealthReason(entry: FallbackEntry): string {
+  if (entry.lastErrorCategory === 'zero_quota') return 'zero quota'
+  if (entry.lastErrorCategory) return entry.lastErrorCategory.replace('_', ' ')
+  if (entry.runtimeBlockedUntil) return 'cooldown'
+  if (!entry.enabled) return 'manual fallback off'
+  return 'healthy'
+}
+
+function formatBlockedUntil(value: string | null): string | null {
+  if (!value) return null
+  const date = new Date(value.replace(' ', 'T'))
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+
+function ModelHealthPanel({
+  entries,
+  onRetry,
+  onEnable,
+  retryingId,
+  toggling,
+}: {
+  entries: FallbackEntry[]
+  onRetry: (entry: FallbackEntry) => void
+  onEnable: (modelDbId: number) => void
+  retryingId: number | null
+  toggling: boolean
+}) {
+  const routableEntries = entries.filter(entry => entry.keyCount > 0)
+  const quarantined = routableEntries.filter(entry =>
+    entry.runtimeStatus !== 'healthy' || entry.runtimeBlockedUntil || entry.lastErrorCategory,
+  )
+  const manuallyDisabled = routableEntries.filter(entry =>
+    !entry.enabled && !quarantined.some(item => item.modelDbId === entry.modelDbId),
+  )
+  const hasIssues = quarantined.length > 0 || manuallyDisabled.length > 0
+
+  return (
+    <section className="rounded-lg border bg-card p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-medium">Model health</h2>
+          <p className="mt-1 text-xs text-muted-foreground">
+            System quarantines and manual fallback disables.
+          </p>
+        </div>
+        <div className="flex gap-2 text-xs tabular-nums">
+          <span className="rounded-full border px-2 py-1">{quarantined.length} quarantined</span>
+          <span className="rounded-full border px-2 py-1">{manuallyDisabled.length} manual off</span>
+        </div>
+      </div>
+
+      {!hasIssues ? (
+        <div className="mt-4 rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+          All fallback models are healthy.
+        </div>
+      ) : (
+        <div className="mt-4 space-y-4">
+          {quarantined.length > 0 && (
+            <HealthGroup
+              title="System quarantined"
+              entries={quarantined}
+              actionLabel="Retry now"
+              onAction={onRetry}
+              busyId={retryingId}
+            />
+          )}
+          {manuallyDisabled.length > 0 && (
+            <HealthGroup
+              title="Manual fallback off"
+              entries={manuallyDisabled}
+              actionLabel="Enable"
+              onAction={(entry) => onEnable(entry.modelDbId)}
+              busyId={toggling ? -1 : null}
+            />
+          )}
+        </div>
+      )}
+    </section>
+  )
+}
+
+function HealthGroup({
+  title,
+  entries,
+  actionLabel,
+  onAction,
+  busyId,
+}: {
+  title: string
+  entries: FallbackEntry[]
+  actionLabel: string
+  onAction: (entry: FallbackEntry) => void
+  busyId: number | null
+}) {
+  return (
+    <div>
+      <h3 className="mb-2 text-xs font-medium uppercase text-muted-foreground">{title}</h3>
+      <div className="divide-y rounded-md border">
+        {entries.map(entry => (
+          <div key={`${title}:${entry.modelDbId}`} className="flex flex-wrap items-center gap-3 p-3">
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="truncate text-sm font-medium">{entry.displayName}</span>
+                <span className="rounded-full border px-2 py-0.5 text-xs text-muted-foreground">
+                  {entry.providerDisplayName}
+                </span>
+                <span className="text-xs text-muted-foreground">{formatHealthReason(entry)}</span>
+              </div>
+              <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                <span className="font-mono">{entry.modelId}</span>
+                {entry.failureCount > 0 && <span>{entry.failureCount} failures</span>}
+                {entry.requiresConfirmation && <span>confirmation required</span>}
+                {formatBlockedUntil(entry.runtimeBlockedUntil) && (
+                  <span>blocked until {formatBlockedUntil(entry.runtimeBlockedUntil)}</span>
+                )}
+              </div>
+              {entry.lastError && (
+                <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{entry.lastError}</p>
+              )}
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => onAction(entry)}
+              disabled={busyId === entry.modelDbId || busyId === -1}
+            >
+              {busyId === entry.modelDbId || busyId === -1
+                ? 'Working…'
+                : entry.requiresConfirmation && actionLabel === 'Retry now'
+                  ? 'Confirm retry'
+                  : actionLabel}
+            </Button>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function TokenUsageBar({ data }: { data: TokenUsageData }) {
   const { totalBudget, totalUsed, models } = data
   const remaining = Math.max(0, totalBudget - totalUsed)
@@ -81,8 +252,8 @@ function TokenUsageBar({ data }: { data: TokenUsageData }) {
   // bar sums to `remaining`; the grey tail represents what's been used.
   const modelsWithWidth = models.map(m => ({
     ...m,
-    remainingTokens: totalBudget > 0 ? (m.budget / totalBudget) * remaining : 0,
-    widthPct: totalBudget > 0 ? (m.budget / totalBudget) * (remaining / totalBudget) * 100 : 0,
+    remainingTokens: totalBudget > 0 ? (m.effectiveBudget / totalBudget) * remaining : 0,
+    widthPct: totalBudget > 0 ? (m.effectiveBudget / totalBudget) * (remaining / totalBudget) * 100 : 0,
   }))
   const usedPct = totalBudget > 0 ? (totalUsed / totalBudget) * 100 : 0
 
@@ -101,7 +272,7 @@ function TokenUsageBar({ data }: { data: TokenUsageData }) {
         {modelsWithWidth.map((m, i) => (
           <div
             key={i}
-            title={`${m.displayName} (${m.platform}) — ${formatTokens(m.remainingTokens)} remaining`}
+            title={`${m.displayName} (${m.platform}) - ${formatBudgetLabel(m.monthlyTokenBudget, m.keyCount, m.effectiveBudget)}; ${formatTokens(m.remainingTokens)} remaining`}
             style={{
               width: `${m.widthPct}%`,
               backgroundColor: platformColors[m.platform] ?? '#94a3b8',
@@ -110,7 +281,7 @@ function TokenUsageBar({ data }: { data: TokenUsageData }) {
         ))}
         {totalUsed > 0 && (
           <div
-            title={`Used — ${formatTokens(totalUsed)}`}
+            title={`Used - ${formatTokens(totalUsed)}`}
             className="bg-muted-foreground/30"
             style={{ width: `${usedPct}%` }}
           />
@@ -125,6 +296,9 @@ function TokenUsageBar({ data }: { data: TokenUsageData }) {
               style={{ backgroundColor: platformColors[m.platform] ?? '#94a3b8' }}
             />
             <span className="truncate">{m.displayName}</span>
+            {m.keyCount > 1 && (
+              <span className="text-muted-foreground">x{m.keyCount}</span>
+            )}
             <span className="flex-1" />
             <span className="font-mono text-muted-foreground">{formatTokens(m.remainingTokens)}</span>
           </div>
@@ -180,13 +354,21 @@ function SortableModelRow({
               −{entry.penalty} penalty
             </span>
           )}
+          {formatRuntimeStatus(entry) && (
+            <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-300">
+              {formatRuntimeStatus(entry)}
+            </span>
+          )}
         </div>
         <div className="flex gap-3 mt-0.5 text-xs text-muted-foreground tabular-nums">
           <span>Intel #{entry.intelligenceRank}</span>
           <span>Speed #{entry.speedRank}</span>
           {entry.rpmLimit && <span>{entry.rpmLimit} rpm</span>}
           {entry.rpdLimit && <span>{entry.rpdLimit} rpd</span>}
-          <span>{entry.monthlyTokenBudget} tok/mo</span>
+          <span>{formatBudgetLabel(entry.monthlyTokenBudget, entry.keyCount, entry.effectiveBudget)}</span>
+          {entry.lastErrorCategory && (
+            <span>{entry.lastErrorCategory.replace('_', ' ')}</span>
+          )}
         </div>
       </div>
       <Switch
@@ -200,6 +382,7 @@ function SortableModelRow({
 export default function FallbackPage() {
   const queryClient = useQueryClient()
   const [localEntries, setLocalEntries] = useState<FallbackEntry[] | null>(null)
+  const [retryingId, setRetryingId] = useState<number | null>(null)
 
   const { data: entries = [], isLoading } = useQuery<FallbackEntry[]>({
     queryKey: ['fallback'],
@@ -217,6 +400,35 @@ export default function FallbackPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['fallback'] })
       setLocalEntries(null)
+    },
+  })
+
+  const toggleMutation = useMutation({
+    mutationFn: ({ modelDbId, enabled }: { modelDbId: number; enabled: boolean }) =>
+      apiFetch(`/api/fallback/${modelDbId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled }),
+      }),
+    onError: () => {
+      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+    },
+  })
+
+  const retryMutation = useMutation({
+    mutationFn: ({ modelDbId, confirm }: { modelDbId: number; confirm: boolean }) =>
+      apiFetch(`/api/fallback/${modelDbId}/retry`, {
+        method: 'POST',
+        body: JSON.stringify({ confirm }),
+      }),
+    onMutate: ({ modelDbId }) => {
+      setRetryingId(modelDbId)
+    },
+    onSettled: () => {
+      setRetryingId(null)
+      queryClient.invalidateQueries({ queryKey: ['fallback'] })
     },
   })
 
@@ -256,7 +468,39 @@ export default function FallbackPage() {
     const updated = allEntries.map(e =>
       e.modelDbId === modelDbId ? { ...e, enabled } : e
     )
-    setLocalEntries(updated)
+    if (localEntries) {
+      setLocalEntries(updated)
+    } else {
+      queryClient.setQueryData<FallbackEntry[]>(['fallback'], old =>
+        old?.map(e => e.modelDbId === modelDbId ? { ...e, enabled } : e)
+      )
+    }
+    toggleMutation.mutate({ modelDbId, enabled })
+  }
+
+  function handleRetry(entry: FallbackEntry) {
+    if (entry.requiresConfirmation) {
+      const confirmed = window.confirm(
+        `${entry.displayName} was quarantined because the provider reported zero quota. Retry only after confirming this account or project has quota for ${entry.modelId}.`
+      )
+      if (!confirmed) return
+    }
+
+    const modelDbId = entry.modelDbId
+    queryClient.setQueryData<FallbackEntry[]>(['fallback'], old =>
+      old?.map(e => e.modelDbId === modelDbId
+        ? {
+          ...e,
+          runtimeStatus: 'healthy',
+          runtimeBlockedUntil: null,
+          lastErrorCategory: null,
+          lastError: null,
+          failureCount: 0,
+          requiresConfirmation: false,
+        }
+        : e)
+    )
+    retryMutation.mutate({ modelDbId, confirm: entry.requiresConfirmation })
   }
 
   function handleSave() {
@@ -295,6 +539,16 @@ export default function FallbackPage() {
       <div className="space-y-6">
         {tokenUsage && tokenUsage.totalBudget > 0 && (
           <TokenUsageBar data={tokenUsage} />
+        )}
+
+        {!isLoading && allEntries.length > 0 && (
+          <ModelHealthPanel
+            entries={allEntries}
+            onRetry={handleRetry}
+            onEnable={(modelDbId) => handleToggle(modelDbId, true)}
+            retryingId={retryingId}
+            toggling={toggleMutation.isPending}
+          />
         )}
 
         {isLoading ? (

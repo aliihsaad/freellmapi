@@ -6,8 +6,10 @@ import {
 } from 'recharts'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { PageHeader } from '@/components/page-header'
+import type { UsageEstimatesResponse, UsagePressure } from '../../../shared/types'
 
 type TimeRange = '24h' | '7d' | '30d'
 
@@ -36,6 +38,13 @@ function Panel({ title, children }: { title: string; children: React.ReactNode }
       <div className="p-4">{children}</div>
     </div>
   )
+}
+
+const pressureClass: Record<UsagePressure, string> = {
+  low: 'border-emerald-500/20 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300',
+  medium: 'border-amber-500/20 bg-amber-500/10 text-amber-600 dark:text-amber-300',
+  high: 'border-orange-500/20 bg-orange-500/10 text-orange-600 dark:text-orange-300',
+  critical: 'border-destructive/20 bg-destructive/10 text-destructive',
 }
 
 const axisStyle = { fontSize: 11, fill: 'var(--muted-foreground)' } as const
@@ -75,6 +84,11 @@ export default function AnalyticsPage() {
     queryFn: () => apiFetch<{ byCategory: any[]; byPlatform: any[]; detailed: any[] }>(`/api/analytics/error-distribution?range=${range}`),
   })
 
+  const { data: usageEstimates } = useQuery<UsageEstimatesResponse>({
+    queryKey: ['analytics', 'usage-estimates', range],
+    queryFn: () => apiFetch(`/api/analytics/usage-estimates?range=${range}`),
+  })
+
   return (
     <div>
       <PageHeader
@@ -106,6 +120,62 @@ export default function AnalyticsPage() {
           <Stat label="Avg latency" value={`${summary?.avgLatencyMs ?? 0} ms`} />
           <Stat label="Est. savings" value={`$${summary?.estimatedCostSavings ?? '0.00'}`} />
         </div>
+
+        {usageEstimates && (
+          <Panel title="Estimated usage">
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-lg font-semibold tabular-nums">{usageEstimates.total.usageText}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">{usageEstimates.note}</p>
+                </div>
+                <Badge variant="outline" className={pressureClass[usageEstimates.total.pressure]}>
+                  {usageEstimates.total.pressure}
+                </Badge>
+              </div>
+
+              {usageEstimates.providers.length === 0 ? (
+                <p className="text-sm text-muted-foreground py-4">No routed usage yet.</p>
+              ) : (
+                <div className="grid gap-3 lg:grid-cols-2">
+                  {usageEstimates.providers.map(provider => (
+                    <div key={provider.platform} className="rounded-md border bg-background p-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-medium">{provider.platform}</p>
+                          <p className="mt-1 text-xs text-muted-foreground tabular-nums">
+                            {provider.usageText}
+                          </p>
+                        </div>
+                        <Badge variant="outline" className={pressureClass[provider.pressure]}>
+                          {provider.pressure}
+                        </Badge>
+                      </div>
+                      <p className="mt-2 text-xs text-muted-foreground tabular-nums">
+                        {provider.requests} requests · {provider.activeKeyCount} keys · {provider.modelCount} estimated models
+                      </p>
+                      {provider.topModels.length > 0 && (
+                        <div className="mt-3 space-y-1.5 border-t pt-2">
+                          {provider.topModels.map(model => (
+                            <div key={`${model.platform}:${model.modelId}`} className="flex items-center gap-2 text-xs">
+                              <span className="min-w-0 flex-1 truncate">{model.displayName}</span>
+                              {model.usageSource === 'session_mint' && (
+                                <Badge variant="outline" className="h-4 px-1 text-[10px] text-muted-foreground">
+                                  session
+                                </Badge>
+                              )}
+                              <span className="font-mono text-muted-foreground tabular-nums">{model.usageText}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </Panel>
+        )}
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <Panel title="Requests by provider">

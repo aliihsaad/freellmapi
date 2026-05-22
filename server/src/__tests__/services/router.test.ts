@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import { initDb, getDb } from '../../db/index.js';
 import { encrypt } from '../../lib/crypto.js';
-import { routeRequest } from '../../services/router.js';
+import { routeCapabilityRequest, routeRequest } from '../../services/router.js';
 
 describe('Router', () => {
   beforeAll(() => {
@@ -95,5 +95,30 @@ describe('Router', () => {
 
     const result = routeRequest();
     expect(result.platform).toBe('groq');
+  });
+
+  it('should route embeddings to an embedding-capable model with an available key', () => {
+    const db = getDb();
+    const key = encrypt('test-openrouter-key');
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run('openrouter', 'test', key.encrypted, key.iv, key.authTag, 'healthy', 1);
+
+    const result = routeCapabilityRequest('embeddings');
+    expect(result.platform).toBe('openrouter');
+    expect(result.modelId).toMatch(/embedding/i);
+    expect(result.apiKey).toBe('test-openrouter-key');
+  });
+
+  it('should not route embeddings to chat-only models', () => {
+    const db = getDb();
+    const key = encrypt('test-groq-key');
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run('groq', 'test', key.encrypted, key.iv, key.authTag, 'healthy', 1);
+
+    expect(() => routeCapabilityRequest('embeddings')).toThrow(/embeddings|exhausted/i);
   });
 });

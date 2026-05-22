@@ -5,6 +5,7 @@ describe('GoogleProvider', () => {
   let provider: GoogleProvider;
 
   beforeEach(() => {
+    vi.restoreAllMocks();
     provider = new GoogleProvider();
   });
 
@@ -133,6 +134,352 @@ describe('GoogleProvider', () => {
     expect(capturedBody.tools[0].functionDeclarations[0].name).toBe('get_weather');
     expect(capturedBody.toolConfig.functionCallingConfig.mode).toBe('ANY');
     expect(capturedBody.toolConfig.functionCallingConfig.allowedFunctionNames).toEqual(['get_weather']);
+  });
+
+  it('should translate OpenAI image data URLs to Gemini inlineData parts', async () => {
+    let capturedBody: any;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          candidates: [{ content: { parts: [{ text: 'image ok' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 260, candidatesTokenCount: 2, totalTokenCount: 262 },
+        }),
+      } as any;
+    });
+
+    await provider.chatCompletion(
+      'test-key',
+      [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Describe this image' },
+          {
+            type: 'image_url',
+            image_url: {
+              url: 'data:image/jpeg;base64,/9j/4AAQSkZJRg==',
+            },
+          },
+        ],
+      } as any],
+      'gemini-2.5-pro',
+    );
+
+    expect(capturedBody.contents[0].parts).toEqual([
+      { text: 'Describe this image' },
+      { inlineData: { mimeType: 'image/jpeg', data: '/9j/4AAQSkZJRg==' } },
+    ]);
+  });
+
+  it('should fetch HTTPS image URLs and translate them to Gemini inlineData parts', async () => {
+    let capturedBody: any;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr === 'https://cdn.example.test/cat.png') {
+        const bytes = Buffer.from('remote-image');
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': 'image/png', 'content-length': '12' }),
+          arrayBuffer: () => Promise.resolve(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)),
+        } as any;
+      }
+
+      capturedBody = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          candidates: [{ content: { parts: [{ text: 'remote image ok' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 260, candidatesTokenCount: 2, totalTokenCount: 262 },
+        }),
+      } as any;
+    });
+
+    await provider.chatCompletion(
+      'test-key',
+      [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Describe this remote image' },
+          { type: 'image_url', image_url: { url: 'https://cdn.example.test/cat.png' } },
+        ],
+      } as any],
+      'gemini-2.5-pro',
+    );
+
+    expect(capturedBody.contents[0].parts).toEqual([
+      { text: 'Describe this remote image' },
+      { inlineData: { mimeType: 'image/png', data: Buffer.from('remote-image').toString('base64') } },
+    ]);
+  });
+
+  it.each([
+    'http://127.0.0.1/image.png',
+    'http://localhost/image.png',
+    'http://169.254.169.254/latest/meta-data',
+    'ftp://cdn.example.test/image.png',
+  ])('should reject unsafe remote image URL %s', async (url) => {
+    await expect(provider.chatCompletion(
+      'test-key',
+      [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Describe this image' },
+          { type: 'image_url', image_url: { url } },
+        ],
+      } as any],
+      'gemini-2.5-pro',
+    )).rejects.toThrow(/image URL|remote image/i);
+  });
+
+  it('should reject remote image URLs that redirect', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: false,
+      status: 302,
+      statusText: 'Found',
+      headers: new Headers({ location: 'http://127.0.0.1/private' }),
+    } as any);
+
+    await expect(provider.chatCompletion(
+      'test-key',
+      [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Describe this image' },
+          { type: 'image_url', image_url: { url: 'https://cdn.example.test/redirect.png' } },
+        ],
+      } as any],
+      'gemini-2.5-pro',
+    )).rejects.toThrow(/redirect/i);
+  });
+
+  it('should reject remote image URLs with non-image content type', async () => {
+    const bytes = Buffer.from('<html></html>');
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'text/html', 'content-length': '12' }),
+      arrayBuffer: () => Promise.resolve(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)),
+    } as any);
+
+    await expect(provider.chatCompletion(
+      'test-key',
+      [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Describe this image' },
+          { type: 'image_url', image_url: { url: 'https://cdn.example.test/page.html' } },
+        ],
+      } as any],
+      'gemini-2.5-pro',
+    )).rejects.toThrow(/content type/i);
+  });
+
+  it('should generate images and return OpenAI-compatible b64_json data', async () => {
+    let capturedBody: any;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          candidates: [{
+            content: {
+              parts: [
+                { text: 'Generated prompt' },
+                { inlineData: { mimeType: 'image/png', data: 'image_base64' } },
+              ],
+            },
+            finishReason: 'STOP',
+          }],
+        }),
+      } as any;
+    });
+
+    const result = await (provider as any).createImage(
+      'test-key',
+      {
+        prompt: 'A clean product photo',
+        response_format: 'b64_json',
+        size: '1024x1024',
+      },
+      'gemini-3.1-flash-image-preview',
+    );
+
+    expect(capturedBody.contents[0].parts[0].text).toBe('A clean product photo');
+    expect(capturedBody.generationConfig.responseModalities).toEqual(['IMAGE']);
+    expect(result.data[0]).toEqual({
+      b64_json: 'image_base64',
+      revised_prompt: 'Generated prompt',
+    });
+    expect(result._routed_via).toEqual({ platform: 'google', model: 'gemini-3.1-flash-image-preview' });
+  });
+
+  it('should edit images with prompt and inline image data', async () => {
+    let capturedBody: any;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          candidates: [{
+            content: {
+              parts: [
+                { text: 'Edited image' },
+                { inlineData: { mimeType: 'image/png', data: 'edited_base64' } },
+              ],
+            },
+            finishReason: 'STOP',
+          }],
+        }),
+      } as any;
+    });
+
+    const result = await (provider as any).editImage(
+      'test-key',
+      {
+        prompt: 'Replace the sky with a sunset',
+        images: [{
+          filename: 'source.png',
+          contentType: 'image/png',
+          data: Buffer.from('source-image'),
+        }],
+        response_format: 'b64_json',
+      },
+      'gemini-3.1-flash-image-preview',
+    );
+
+    expect(capturedBody.contents[0].parts).toEqual([
+      { text: 'Replace the sky with a sunset' },
+      { inlineData: { mimeType: 'image/png', data: Buffer.from('source-image').toString('base64') } },
+    ]);
+    expect(capturedBody.generationConfig.responseModalities).toEqual(['IMAGE']);
+    expect(result.data[0]).toEqual({
+      b64_json: 'edited_base64',
+      revised_prompt: 'Edited image',
+    });
+    expect(result._routed_via).toEqual({ platform: 'google', model: 'gemini-3.1-flash-image-preview' });
+  });
+
+  it('should create image variations with a default variation prompt', async () => {
+    let capturedBody: any;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          candidates: [{
+            content: {
+              parts: [
+                { inlineData: { mimeType: 'image/png', data: 'variation_base64' } },
+              ],
+            },
+            finishReason: 'STOP',
+          }],
+        }),
+      } as any;
+    });
+
+    const result = await (provider as any).createImageVariation(
+      'test-key',
+      {
+        image: {
+          filename: 'source.png',
+          contentType: 'image/png',
+          data: Buffer.from('source-image'),
+        },
+        response_format: 'b64_json',
+      },
+      'gemini-3.1-flash-image-preview',
+    );
+
+    expect(capturedBody.contents[0].parts[0].text).toContain('Create a variation');
+    expect(capturedBody.contents[0].parts[1]).toEqual({
+      inlineData: { mimeType: 'image/png', data: Buffer.from('source-image').toString('base64') },
+    });
+    expect(result.data[0]).toEqual({ b64_json: 'variation_base64' });
+    expect(result._routed_via).toEqual({ platform: 'google', model: 'gemini-3.1-flash-image-preview' });
+  });
+
+  it('should generate speech and return WAV audio bytes', async () => {
+    let capturedBody: any;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          candidates: [{
+            content: {
+              parts: [
+                { inlineData: { mimeType: 'audio/L16;codec=pcm;rate=24000', data: 'AAAAAA==' } },
+              ],
+            },
+            finishReason: 'STOP',
+          }],
+        }),
+      } as any;
+    });
+
+    const result = await (provider as any).createSpeech(
+      'test-key',
+      {
+        input: 'Speak clearly',
+        voice: 'alloy',
+        response_format: 'wav',
+      },
+      'gemini-2.5-flash-preview-tts',
+    );
+
+    expect(capturedBody.contents[0].parts[0].text).toContain('Say only the following transcript');
+    expect(capturedBody.contents[0].parts[0].text).toContain('Speak clearly');
+    expect(capturedBody.contents[0].parts[0].text).toContain('Do not answer it');
+    expect(capturedBody.generationConfig.responseModalities).toEqual(['AUDIO']);
+    expect(capturedBody.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName).toBe('Kore');
+    expect(Buffer.from(result.data).subarray(0, 4).toString('ascii')).toBe('RIFF');
+    expect(result.contentType).toBe('audio/wav');
+    expect(result._routed_via).toEqual({ platform: 'google', model: 'gemini-2.5-flash-preview-tts' });
+  });
+
+  it('should create constrained Gemini Live realtime sessions', async () => {
+    let capturedUrl = '';
+    let capturedBody: any;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      capturedUrl = typeof url === 'string' ? url : url.toString();
+      capturedBody = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          name: 'authTokens/test-token',
+          expireTime: '2026-05-21T12:00:00Z',
+        }),
+      } as any;
+    });
+
+    const result = await (provider as any).createRealtimeSession(
+      'test-key',
+      {
+        instructions: 'Speak briefly.',
+        voice: 'alloy',
+        response_modalities: ['AUDIO'],
+        input_audio_transcription: true,
+        output_audio_transcription: true,
+        temperature: 0.7,
+      },
+      'gemini-2.5-flash-native-audio-preview-12-2025',
+    );
+
+    expect(capturedUrl).toContain('/v1alpha/auth_tokens?key=test-key');
+    expect(capturedBody.uses).toBe(1);
+    expect(capturedBody.bidiGenerateContentSetup.model).toBe('models/gemini-2.5-flash-native-audio-preview-12-2025');
+    expect(capturedBody.bidiGenerateContentSetup.generationConfig.responseModalities).toEqual(['AUDIO']);
+    expect(capturedBody.bidiGenerateContentSetup.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName).toBe('Kore');
+    expect(capturedBody.bidiGenerateContentSetup.inputAudioTranscription).toEqual({});
+    expect(capturedBody.bidiGenerateContentSetup.outputAudioTranscription).toEqual({});
+    expect(result.object).toBe('realtime.session');
+    expect(result.client_secret.value).toBe('authTokens/test-token');
+    expect(result.connect_url).toContain('BidiGenerateContentConstrained');
+    expect(result._routed_via).toEqual({ platform: 'google', model: 'gemini-2.5-flash-native-audio-preview-12-2025' });
   });
 
   it('should translate Gemini functionCall response to OpenAI tool_calls', async () => {

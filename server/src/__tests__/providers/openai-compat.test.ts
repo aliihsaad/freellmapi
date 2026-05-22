@@ -92,6 +92,132 @@ describe('OpenAICompatProvider', () => {
     expect(capturedBody.parallel_tool_calls).toBe(true);
   });
 
+  it('should create embeddings via the OpenAI-compatible embeddings endpoint', async () => {
+    let capturedUrl = '';
+    let capturedHeaders: Record<string, string> = {};
+    let capturedBody: any = null;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      capturedUrl = url as string;
+      capturedHeaders = (init as any).headers;
+      capturedBody = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          object: 'list',
+          data: [
+            { object: 'embedding', embedding: [0.1, 0.2], index: 0 },
+            { object: 'embedding', embedding: [0.3, 0.4], index: 1 },
+          ],
+          model: 'embed-model',
+          usage: { prompt_tokens: 4, total_tokens: 4 },
+        }),
+      } as any;
+    });
+
+    const result = await provider.createEmbedding(
+      'my-key',
+      ['one', 'two'],
+      'embed-model',
+      { encoding_format: 'float', dimensions: 2, user: 'test-user' },
+    );
+
+    expect(capturedUrl).toBe('https://api.test.com/v1/embeddings');
+    expect(capturedHeaders['Authorization']).toBe('Bearer my-key');
+    expect(capturedHeaders['X-Custom']).toBe('test');
+    expect(capturedBody).toEqual({
+      model: 'embed-model',
+      input: ['one', 'two'],
+      encoding_format: 'float',
+      dimensions: 2,
+      user: 'test-user',
+    });
+    expect(result.object).toBe('list');
+    expect(result.data).toHaveLength(2);
+    expect(result._routed_via).toEqual({ platform: 'groq', model: 'embed-model' });
+  });
+
+  it('should forward transcription requests to the OpenAI-compatible audio endpoint', async () => {
+    let capturedUrl = '';
+    let capturedHeaders: Record<string, string> = {};
+    let capturedBody: FormData | null = null;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      capturedUrl = url as string;
+      capturedHeaders = (init as any).headers;
+      capturedBody = (init as any).body as FormData;
+      return {
+        ok: true,
+        headers: new Headers({ 'content-type': 'application/json' }),
+        json: () => Promise.resolve({ text: 'transcribed text' }),
+        text: () => Promise.resolve(JSON.stringify({ text: 'transcribed text' })),
+      } as any;
+    });
+
+    const result = await (provider as any).transcribeAudio(
+      'my-key',
+      {
+        file: {
+          filename: 'sample.wav',
+          contentType: 'audio/wav',
+          data: Buffer.from('audio-bytes'),
+        },
+        language: 'en',
+        response_format: 'json',
+        timestamp_granularities: ['word'],
+      },
+      'whisper-large-v3-turbo',
+    );
+
+    expect(capturedUrl).toBe('https://api.test.com/v1/audio/transcriptions');
+    expect(capturedHeaders['Authorization']).toBe('Bearer my-key');
+    expect(capturedHeaders['X-Custom']).toBe('test');
+    expect(capturedBody?.get('model')).toBe('whisper-large-v3-turbo');
+    expect(capturedBody?.get('language')).toBe('en');
+    expect(capturedBody?.get('timestamp_granularities[]')).toBe('word');
+    const file = capturedBody?.get('file') as any;
+    expect(file.name).toBe('sample.wav');
+    expect(await file.text()).toBe('audio-bytes');
+    expect(result.body).toEqual({ text: 'transcribed text' });
+    expect(result._routed_via).toEqual({ platform: 'groq', model: 'whisper-large-v3-turbo' });
+  });
+
+  it('should forward translation requests to the OpenAI-compatible audio endpoint', async () => {
+    let capturedUrl = '';
+    let capturedBody: FormData | null = null;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      capturedUrl = url as string;
+      capturedBody = (init as any).body as FormData;
+      return {
+        ok: true,
+        headers: new Headers({ 'content-type': 'application/json' }),
+        json: () => Promise.resolve({ text: 'translated text' }),
+        text: () => Promise.resolve(JSON.stringify({ text: 'translated text' })),
+      } as any;
+    });
+
+    const result = await (provider as any).translateAudio(
+      'my-key',
+      {
+        file: {
+          filename: 'sample.m4a',
+          contentType: 'audio/mp4',
+          data: Buffer.from('audio-m4a'),
+        },
+        prompt: 'domain words',
+        response_format: 'json',
+      },
+      'whisper-large-v3',
+    );
+
+    expect(capturedUrl).toBe('https://api.test.com/v1/audio/translations');
+    expect(capturedBody?.get('model')).toBe('whisper-large-v3');
+    expect(capturedBody?.get('prompt')).toBe('domain words');
+    expect(result.body).toEqual({ text: 'translated text' });
+    expect(result._routed_via).toEqual({ platform: 'groq', model: 'whisper-large-v3' });
+  });
+
   it('should throw on error response', async () => {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({
       ok: false,
@@ -103,6 +229,24 @@ describe('OpenAICompatProvider', () => {
     await expect(
       provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')
     ).rejects.toThrow(/Too many requests/);
+  });
+
+  it('should throw when a 2xx response body contains an OpenAI-style error', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: () => Promise.resolve({
+        error: {
+          message: 'Provider returned error',
+          code: 429,
+        },
+      }),
+    } as any);
+
+    await expect(
+      provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')
+    ).rejects.toThrow(/Provider returned error/);
   });
 
   it('should validate key using models endpoint', async () => {

@@ -4,8 +4,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Button } from '@/components/ui/button'
 import KeysPage from '@/pages/KeysPage'
 import PlaygroundPage from '@/pages/PlaygroundPage'
+import IntegrationsPage from '@/pages/IntegrationsPage'
 import FallbackPage from '@/pages/FallbackPage'
 import AnalyticsPage from '@/pages/AnalyticsPage'
+import CapabilitiesPage from '@/pages/CapabilitiesPage'
+import LogsPage from '@/pages/LogsPage'
 
 const queryClient = new QueryClient()
 
@@ -58,10 +61,15 @@ function DarkModeToggle() {
 }
 
 function Brand() {
+  const logoSrc = `${import.meta.env.BASE_URL}logo-mark.svg`
+
   return (
-    <div className="flex items-center gap-2">
-      <span className="inline-block size-2 rounded-full bg-foreground" />
+    <div className="flex items-center gap-2.5">
+      <img src={logoSrc} alt="" className="size-5 shrink-0" aria-hidden="true" />
       <span className="font-semibold tracking-tight text-sm">FreeLLMAPI</span>
+      <span className="rounded-sm border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none tracking-[0.12em] text-emerald-700 dark:text-emerald-300">
+        Pro Max
+      </span>
     </div>
   )
 }
@@ -74,10 +82,13 @@ function App() {
           <header className="sticky top-0 z-40 bg-background/80 backdrop-blur border-b">
             <div className="max-w-6xl mx-auto px-6 flex items-center">
               <Brand />
-              <nav className="flex items-center gap-6 ml-10">
+              <nav className="flex items-center gap-5 ml-10">
                 <NavItem to="/playground">Playground</NavItem>
+                <NavItem to="/integrations">Integrations</NavItem>
                 <NavItem to="/keys">Keys</NavItem>
                 <NavItem to="/fallback">Fallback</NavItem>
+                <NavItem to="/capabilities">Capabilities</NavItem>
+                <NavItem to="/logs">Logs</NavItem>
                 <NavItem to="/analytics">Analytics</NavItem>
               </nav>
               <div className="ml-auto py-2">
@@ -89,8 +100,11 @@ function App() {
             <Routes>
               <Route path="/" element={<Navigate to="/playground" replace />} />
               <Route path="/playground" element={<PlaygroundPage />} />
+              <Route path="/integrations" element={<IntegrationsPage />} />
               <Route path="/keys" element={<KeysPage />} />
               <Route path="/fallback" element={<FallbackPage />} />
+              <Route path="/capabilities" element={<CapabilitiesPage />} />
+              <Route path="/logs" element={<LogsPage />} />
               <Route path="/analytics" element={<AnalyticsPage />} />
               <Route path="/test" element={<Navigate to="/playground" replace />} />
               <Route path="/health" element={<Navigate to="/keys" replace />} />

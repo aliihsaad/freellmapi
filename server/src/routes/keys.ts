@@ -3,20 +3,15 @@ import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
+import { PLATFORM_ORDER } from '../lib/provider-metadata.js';
 
 export const keysRouter = Router();
 
 // Active providers — must match providers/index.ts registrations + shared/types.ts Platform.
 // Hugging Face, Moonshot, and MiniMax direct integrations were dropped in V4
 // (see migrateModelsV4 comment block).
-const PLATFORMS = [
-  'google', 'groq', 'cerebras', 'sambanova', 'nvidia', 'mistral',
-  'openrouter', 'github', 'cohere', 'cloudflare', 'zhipu', 'ollama',
-  'kilo', 'pollinations', 'llm7',
-] as const;
-
 const addKeySchema = z.object({
-  platform: z.enum(PLATFORMS),
+  platform: z.enum(PLATFORM_ORDER),
   key: z.string().min(1),
   label: z.string().optional(),
 });
