@@ -555,8 +555,8 @@ export function PlaygroundChatPanel({ apiKey, models, capabilityData }: Playgrou
   }
 
   return (
-    <div className="grid min-h-0 flex-1 gap-4 lg:grid-cols-[340px_minmax(0,1fr)]">
-      <section className="min-w-0 rounded-lg border bg-card p-4">
+    <div className="grid min-h-0 gap-4 lg:h-[calc(100vh-15rem)] lg:min-h-[620px] lg:grid-cols-[340px_minmax(0,1fr)]">
+      <section className="min-w-0 overflow-y-auto rounded-lg border bg-card p-4 lg:max-h-full">
         <div className="flex items-start justify-between gap-3">
           <div>
             <h2 className="text-sm font-medium">Chat workspace</h2>
@@ -714,7 +714,7 @@ export function PlaygroundChatPanel({ apiKey, models, capabilityData }: Playgrou
         </div>
       </section>
 
-      <section className="flex min-h-[620px] min-w-0 flex-col overflow-hidden rounded-lg border bg-card">
+      <section className="flex min-h-[620px] min-w-0 flex-col overflow-hidden rounded-lg border bg-card lg:min-h-0 lg:max-h-full">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3">
           <div className="min-w-0">
             <h2 className="text-sm font-medium">Conversation</h2>
@@ -729,7 +729,7 @@ export function PlaygroundChatPanel({ apiKey, models, capabilityData }: Playgrou
           )}
         </div>
 
-        <div className="min-w-0 flex-1 overflow-y-auto p-4">
+        <div className="min-h-0 min-w-0 flex-1 overflow-y-auto p-4">
           {messages.length === 0 ? (
             <div className="flex h-full items-center justify-center text-center text-sm text-muted-foreground">
               Choose a capability, send a request, and responses will stay here for the session.
