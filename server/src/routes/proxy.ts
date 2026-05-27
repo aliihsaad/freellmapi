@@ -286,6 +286,8 @@ const realtimeSessionSchema: z.ZodType<RealtimeSessionRequest> = z.object({
   temperature: z.number().min(0).max(2).optional(),
   expires_in_seconds: z.number().int().min(60).max(20 * 60 * 60).optional(),
   user: z.string().optional(),
+  tools: z.array(toolDefinitionSchema).optional(),
+  tool_choice: toolChoiceSchema.optional(),
 });
 
 const multipartParser = express.raw({

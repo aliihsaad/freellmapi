@@ -93,6 +93,114 @@ describe('Realtime sessions proxy route', () => {
     expect(providerBody.bidiGenerateContentSetup.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName).toBe('Kore');
   });
 
+  it('forwards tools and tool_choice into bidiGenerateContentSetup', async () => {
+    await request(app, 'POST', '/api/keys', {
+      platform: 'google',
+      key: 'google_realtime_tools_test_key',
+      label: 'realtime-tools',
+    });
+
+    const origFetch = global.fetch;
+    let providerBody: any = null;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('generativelanguage.googleapis.com/v1alpha/auth_tokens')) {
+        providerBody = JSON.parse((init as any).body);
+        return {
+          ok: true,
+          json: () => Promise.resolve({
+            name: 'authTokens/test-realtime-tools-token',
+            expireTime: '2026-05-21T12:00:00Z',
+          }),
+        } as any;
+      }
+      return origFetch(url, init);
+    });
+
+    const { status, body } = await request(app, 'POST', '/v1/realtime/sessions', {
+      model: 'auto',
+      response_modalities: ['AUDIO'],
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'solve_with_openrouter',
+            description: 'Escalate to the Detail window with an OpenRouter model.',
+            parameters: {
+              type: 'object',
+              properties: { query: { type: 'string' } },
+              required: ['query'],
+            },
+          },
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'analyze_current_screen',
+            description: 'Analyze the user current screen.',
+          },
+        },
+      ],
+      tool_choice: 'auto',
+    });
+
+    expect(status).toBe(200);
+    expect(body.object).toBe('realtime.session');
+
+    const setup = providerBody.bidiGenerateContentSetup;
+    expect(setup.tools).toBeDefined();
+    expect(Array.isArray(setup.tools)).toBe(true);
+    expect(setup.tools[0].functionDeclarations).toHaveLength(2);
+    expect(setup.tools[0].functionDeclarations[0].name).toBe('solve_with_openrouter');
+    expect(setup.tools[0].functionDeclarations[0].parameters).toEqual({
+      type: 'object',
+      properties: { query: { type: 'string' } },
+      required: ['query'],
+    });
+    expect(setup.tools[0].functionDeclarations[1].name).toBe('analyze_current_screen');
+
+    expect(setup.toolConfig).toEqual({ functionCallingConfig: { mode: 'AUTO' } });
+
+    expect(body.config.tools).toEqual(['solve_with_openrouter', 'analyze_current_screen']);
+  });
+
+  it('omits tools and toolConfig from setup when none are sent', async () => {
+    await request(app, 'POST', '/api/keys', {
+      platform: 'google',
+      key: 'google_realtime_no_tools_key',
+      label: 'realtime-no-tools',
+    });
+
+    const origFetch = global.fetch;
+    let providerBody: any = null;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('generativelanguage.googleapis.com/v1alpha/auth_tokens')) {
+        providerBody = JSON.parse((init as any).body);
+        return {
+          ok: true,
+          json: () => Promise.resolve({
+            name: 'authTokens/test-no-tools-token',
+            expireTime: '2026-05-21T12:00:00Z',
+          }),
+        } as any;
+      }
+      return origFetch(url, init);
+    });
+
+    const { status } = await request(app, 'POST', '/v1/realtime/sessions', {
+      model: 'auto',
+      response_modalities: ['AUDIO'],
+    });
+
+    expect(status).toBe(200);
+    const setup = providerBody.bidiGenerateContentSetup;
+    expect(setup.tools).toBeUndefined();
+    expect(setup.toolConfig).toBeUndefined();
+  });
+
   it('rejects an explicit non-realtime model', async () => {
     const { status, body } = await request(app, 'POST', '/v1/realtime/sessions', {
       model: 'mistral-large-latest',

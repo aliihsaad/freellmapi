@@ -686,6 +686,9 @@ export class GoogleProvider extends BaseProvider {
         : undefined,
     };
 
+    const geminiTools = toGeminiTools(request.tools);
+    const geminiToolConfig = toGeminiToolConfig(request.tool_choice);
+
     const setup: Record<string, unknown> = {
       model: `models/${modelId}`,
       generationConfig,
@@ -694,6 +697,8 @@ export class GoogleProvider extends BaseProvider {
         : undefined,
       inputAudioTranscription: request.input_audio_transcription ? {} : undefined,
       outputAudioTranscription: request.output_audio_transcription ? {} : undefined,
+      tools: geminiTools,
+      toolConfig: geminiToolConfig,
     };
 
     const body = {
@@ -741,6 +746,7 @@ export class GoogleProvider extends BaseProvider {
         voice: request.voice,
         instructions: request.instructions,
         temperature: request.temperature,
+        tools: request.tools?.map(t => t.function.name),
       },
       _routed_via: { platform: 'google', model: modelId },
     };

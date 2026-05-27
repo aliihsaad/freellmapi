@@ -428,6 +428,8 @@ export interface RealtimeSessionRequest {
   temperature?: number;
   expires_in_seconds?: number;
   user?: string;
+  tools?: ChatToolDefinition[];
+  tool_choice?: ChatToolChoice;
 }
 
 export interface RealtimeSessionResponse {
@@ -448,6 +450,7 @@ export interface RealtimeSessionResponse {
     voice?: string;
     instructions?: string;
     temperature?: number;
+    tools?: string[];
   };
   _routed_via?: {
     platform: Platform;
