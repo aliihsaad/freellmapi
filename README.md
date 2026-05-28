@@ -76,9 +76,9 @@ The problem is that stacking them by hand is painful: many SDKs, many rate limit
 - **Image generation, edits, and variations** — `POST /v1/images/generations`, `/v1/images/edits`, and `/v1/images/variations` route to configured image-capable providers and return OpenAI-compatible image data. The first provider path supports Google Gemini image models.
 - **Speech generation** — `POST /v1/audio/speech` routes text-to-speech requests to configured audio-capable providers. The first provider path supports Google Gemini TTS and returns WAV or PCM audio.
 - **Audio transcription and translation** — `POST /v1/audio/transcriptions` and `/v1/audio/translations` accept OpenAI-style multipart uploads and route to configured audio-capable providers. The first provider path supports Groq Whisper models.
-- **Realtime audio sessions (beta)** — `POST /v1/realtime/sessions` mints a short-lived Gemini Live session token and constrained WebSocket URL so trusted clients can run realtime audio without seeing your long-lived Google API key.
+- **Realtime audio sessions (beta)** — `POST /v1/realtime/sessions` mints a short-lived Gemini Live session token and constrained WebSocket URL so trusted clients can run realtime audio without seeing your long-lived Google API key. Accepts OpenAI-style `tools` / `tool_choice` and bakes them into the ephemeral `bidiGenerateContentSetup`, so Gemini Live emits native `functionCall` events for any catalog the client supplies.
 - **Streaming and non-streaming** — Server-Sent Events for `stream: true`, JSON response otherwise. Every provider adapter implements both.
-- **Tool calling** — OpenAI-style `tools` / `tool_choice` requests are passed through, and assistant `tool_calls` + `tool` role follow-up messages round-trip across providers.
+- **Tool calling** — OpenAI-style `tools` / `tool_choice` requests are passed through on `/v1/chat/completions` (assistant `tool_calls` + `tool` role follow-up messages round-trip across providers) **and** on `/v1/realtime/sessions` (the tool catalog is embedded in the ephemeral Gemini Live setup so the realtime model can issue native `functionCall` events).
 - **Automatic fallover** — If the chosen provider returns a 429, 5xx, or times out, the router skips it, puts the key on a short cooldown, and retries on the next model in your fallback chain (up to 20 attempts).
 - **Per-key rate tracking** — RPM, RPD, TPM, and TPD counters per `(platform, model, key)` so the router always picks a key that's under its caps.
 - **Sticky sessions** — Multi-turn conversations keep talking to the same model for 30 minutes to avoid the hallucination spike that comes from mid-conversation model switches.
@@ -271,11 +271,24 @@ curl http://localhost:3001/v1/realtime/sessions \
     "voice": "alloy",
     "response_modalities": ["AUDIO"],
     "input_audio_transcription": true,
-    "output_audio_transcription": true
+    "output_audio_transcription": true,
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Look up current weather.",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    }],
+    "tool_choice": "auto"
   }'
 ```
 
-Use the returned `client_secret.value` and `connect_url` from a trusted client to open the Gemini Live WebSocket session. The long-lived Google API key stays encrypted in FreeLLMAPI.
+Use the returned `client_secret.value` and `connect_url` from a trusted client to open the Gemini Live WebSocket session. The long-lived Google API key stays encrypted in FreeLLMAPI. If you pass `tools`, they are embedded into the ephemeral `bidiGenerateContentSetup` and the live model will emit native `functionCall` frames over the WebSocket — your client just has to execute them and send a `toolResponse` back. The response `config.tools` echoes the names that were registered.
 
 **Tool calling**
 
