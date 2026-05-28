@@ -15,3 +15,8 @@ update-hermes.sh
 
 # Local Codex/Vault agent instructions
 AGENTS.md
+
+# Local debugging / test artifacts
+.playwright-cli/
+output/
+test-results/
