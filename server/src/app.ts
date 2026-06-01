@@ -12,6 +12,8 @@ import { logsRouter } from './routes/logs.js';
 import { healthRouter } from './routes/health.js';
 import { settingsRouter } from './routes/settings.js';
 import { modelSweepsRouter } from './routes/model-sweeps.js';
+import { authRouter } from './routes/auth.js';
+import { adminAuthMiddleware } from './middleware/adminAuth.js';
 import { errorHandler } from './middleware/errorHandler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -32,6 +34,14 @@ export function createApp() {
   // with the multipart image/audio limit so local files work consistently.
   app.use(express.json({ limit: JSON_BODY_LIMIT }));
   app.use(express.urlencoded({ extended: true, limit: JSON_BODY_LIMIT }));
+
+  // Public auth endpoints. The config route enforces its own session check
+  // once a dashboard PIN is already enabled.
+  app.use('/api/auth', authRouter);
+
+  // Dashboard/admin API routes are open by default for local-first use, and
+  // require a valid dashboard session only after the owner enables PIN auth.
+  app.use('/api', adminAuthMiddleware);
 
   // API routes
   app.use('/api/keys', keysRouter);

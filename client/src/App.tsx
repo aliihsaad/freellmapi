@@ -9,6 +9,8 @@ import FallbackPage from '@/pages/FallbackPage'
 import AnalyticsPage from '@/pages/AnalyticsPage'
 import CapabilitiesPage from '@/pages/CapabilitiesPage'
 import LogsPage from '@/pages/LogsPage'
+import SettingsPage from '@/pages/SettingsPage'
+import { AuthGate } from '@/components/auth-gate'
 
 const queryClient = new QueryClient()
 
@@ -30,17 +32,15 @@ function NavItem({ to, children }: { to: string; children: React.ReactNode }) {
 }
 
 function DarkModeToggle() {
-  const [dark, setDark] = useState(() =>
-    typeof window !== 'undefined' && document.documentElement.classList.contains('dark')
-  )
+  const [dark, setDark] = useState(() => {
+    if (typeof window === 'undefined') return false
+    const stored = localStorage.getItem('theme')
+    return stored === 'dark' || (!stored && window.matchMedia('(prefers-color-scheme: dark)').matches)
+  })
 
   useEffect(() => {
-    const stored = localStorage.getItem('theme')
-    if (stored === 'dark' || (!stored && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
-      document.documentElement.classList.add('dark')
-      setDark(true)
-    }
-  }, [])
+    document.documentElement.classList.toggle('dark', dark)
+  }, [dark])
 
   function toggle() {
     const next = !dark
@@ -78,39 +78,43 @@ function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <BrowserRouter basename={import.meta.env.BASE_URL}>
-        <div className="min-h-screen bg-background">
-          <header className="sticky top-0 z-40 bg-background/80 backdrop-blur border-b">
-            <div className="max-w-6xl mx-auto px-6 flex items-center">
-              <Brand />
-              <nav className="flex items-center gap-5 ml-10">
-                <NavItem to="/playground">Playground</NavItem>
-                <NavItem to="/integrations">Integrations</NavItem>
-                <NavItem to="/keys">Keys</NavItem>
-                <NavItem to="/fallback">Fallback</NavItem>
-                <NavItem to="/capabilities">Capabilities</NavItem>
-                <NavItem to="/logs">Logs</NavItem>
-                <NavItem to="/analytics">Analytics</NavItem>
-              </nav>
-              <div className="ml-auto py-2">
-                <DarkModeToggle />
+        <AuthGate>
+          <div className="min-h-screen bg-background">
+            <header className="sticky top-0 z-40 bg-background/80 backdrop-blur border-b">
+              <div className="max-w-6xl mx-auto px-6 flex items-center">
+                <Brand />
+                <nav className="flex items-center gap-5 ml-10">
+                  <NavItem to="/playground">Playground</NavItem>
+                  <NavItem to="/integrations">Integrations</NavItem>
+                  <NavItem to="/keys">Keys</NavItem>
+                  <NavItem to="/fallback">Fallback</NavItem>
+                  <NavItem to="/capabilities">Capabilities</NavItem>
+                  <NavItem to="/logs">Logs</NavItem>
+                  <NavItem to="/analytics">Analytics</NavItem>
+                  <NavItem to="/settings">Settings</NavItem>
+                </nav>
+                <div className="ml-auto py-2">
+                  <DarkModeToggle />
+                </div>
               </div>
-            </div>
-          </header>
-          <main className="max-w-6xl mx-auto px-6 py-8">
-            <Routes>
-              <Route path="/" element={<Navigate to="/playground" replace />} />
-              <Route path="/playground" element={<PlaygroundPage />} />
-              <Route path="/integrations" element={<IntegrationsPage />} />
-              <Route path="/keys" element={<KeysPage />} />
-              <Route path="/fallback" element={<FallbackPage />} />
-              <Route path="/capabilities" element={<CapabilitiesPage />} />
-              <Route path="/logs" element={<LogsPage />} />
-              <Route path="/analytics" element={<AnalyticsPage />} />
-              <Route path="/test" element={<Navigate to="/playground" replace />} />
-              <Route path="/health" element={<Navigate to="/keys" replace />} />
-            </Routes>
-          </main>
-        </div>
+            </header>
+            <main className="max-w-6xl mx-auto px-6 py-8">
+              <Routes>
+                <Route path="/" element={<Navigate to="/playground" replace />} />
+                <Route path="/playground" element={<PlaygroundPage />} />
+                <Route path="/integrations" element={<IntegrationsPage />} />
+                <Route path="/keys" element={<KeysPage />} />
+                <Route path="/fallback" element={<FallbackPage />} />
+                <Route path="/capabilities" element={<CapabilitiesPage />} />
+                <Route path="/logs" element={<LogsPage />} />
+                <Route path="/analytics" element={<AnalyticsPage />} />
+                <Route path="/settings" element={<SettingsPage />} />
+                <Route path="/test" element={<Navigate to="/playground" replace />} />
+                <Route path="/health" element={<Navigate to="/keys" replace />} />
+              </Routes>
+            </main>
+          </div>
+        </AuthGate>
       </BrowserRouter>
     </QueryClientProvider>
   )

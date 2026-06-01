@@ -84,6 +84,7 @@ The problem is that stacking them by hand is painful: many SDKs, many rate limit
 - **Sticky sessions** — Multi-turn conversations keep talking to the same model for 30 minutes to avoid the hallucination spike that comes from mid-conversation model switches.
 - **Encrypted key storage** — API keys are encrypted with AES-256-GCM before hitting SQLite; decryption happens in-memory just before a request.
 - **Unified API key** — Clients authenticate to your proxy with a single `freellmapi-…` bearer token. You never expose upstream provider keys to your apps.
+- **Optional dashboard PIN** — If you expose the dashboard online, enable a single-user PIN from **Settings**. It locks the web UI and management APIs while leaving `/v1/*` on the unified bearer key for apps.
 - **Health checks** — Periodic probes mark keys as `healthy`, `rate_limited`, `invalid`, or `error` so the router skips dead ones automatically.
 - **Admin dashboard** — React + Vite UI to manage keys, reorder the fallback chain, inspect analytics, test every capability from the Playground, and copy SDK snippets from the Integrations page. Dark mode included.
 - **Analytics** — Per-request logging with latency, token counts, success rate, and per-provider breakdowns.
@@ -130,6 +131,8 @@ For a production build:
 npm run build
 node server/dist/index.js     # server + dashboard both served on :3001
 ```
+
+If you run the dashboard on a public or semi-public server, open **Settings** and enable the **Dashboard PIN**. This protects the browser UI and `/api/*` management routes with an HTTP-only session cookie. Your OpenAI-compatible clients still authenticate to `/v1/*` with the unified `freellmapi-…` bearer key.
 
 ## Using the API
 
@@ -340,6 +343,16 @@ Every response carries an `X-Routed-Via: <platform>/<model>` header so you can s
 
 Manage provider credentials and grab the unified API key your apps connect with. Each key shows a status dot and when it was last health-checked.
 
+### Settings / dashboard PIN
+
+Enable the optional dashboard PIN before exposing the web UI outside your machine. The PIN protects the dashboard and admin APIs only; your apps keep using the unified API key against `/v1`.
+
+![Dashboard PIN settings](repo-assets/set-pin.png)
+
+When PIN auth is enabled, visitors see the locked dashboard screen until they enter the PIN.
+
+![Dashboard PIN login screen](repo-assets/login.png)
+
 ### Playground
 
 Use the **Chat** tab as a live workspace for chat, vision with URL or local image selection, embeddings, image/audio actions, speech playback, and realtime voice sessions. Switch to **Test Lab** for endpoint diagnostics, raw JSON inspection, and the all-model sweep/quarantine flow.
@@ -412,6 +425,7 @@ Request volume, success rate, tokens in and out, average latency, estimated savi
 - **Provider adapters** (`server/src/providers/*.ts`) — one file per provider, implementing the `Provider` base class: `chatCompletion()` and `streamChatCompletion()`.
 - **Health service** (`server/src/services/health.ts`) — periodic probe keeps key status fresh.
 - **Dashboard** (`client/`) — React + Vite + shadcn/ui admin surface.
+- **Dashboard auth** (`server/src/routes/auth.ts`, `server/src/middleware/adminAuth.ts`) — optional PIN gate for the web UI and `/api/*` management routes. `/v1/*` stays on unified bearer-key auth for clients.
 - **Storage** — SQLite (`better-sqlite3`) with AES-256-GCM envelope encryption for keys.
 
 ## Limitations
@@ -423,7 +437,7 @@ Stacking free tiers has real trade-offs. Be honest with yourself about them:
 - **Latency is highly variable.** Cerebras and Groq are extremely fast; others are not. You get whichever one is available.
 - **Free tiers can change without notice.** Providers regularly tighten, loosen, or remove free tiers. When that happens you'll see 429s or auth errors until you update the catalog. Re-seed scripts live in `server/src/scripts/`.
 - **No SLA, by definition.** If you need reliability, use a paid provider with a contract.
-- **Local-first.** There's no multi-tenant auth. Run this for yourself; don't expose it to the internet.
+- **Single-user by design.** The optional dashboard PIN is a practical guard for your own online deployment, not multi-tenant identity, RBAC, or billing. Use HTTPS/reverse-proxy access controls for anything serious.
 
 ## Contributing
 
