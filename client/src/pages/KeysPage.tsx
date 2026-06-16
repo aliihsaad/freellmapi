@@ -7,8 +7,8 @@ import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { PageHeader } from '@/components/page-header'
 import { ProviderHelperLinks } from '@/components/provider-helper-links'
-import { Info } from 'lucide-react'
-import type { ApiKey, Platform, ProviderMetadata, ProvidersResponse } from '../../../shared/types'
+import { Check, Clipboard, Info } from 'lucide-react'
+import type { ApiKey, ApiKeySecret, Platform, ProviderMetadata, ProvidersResponse } from '../../../shared/types'
 
 const FALLBACK_PROVIDERS: ProviderMetadata[] = [
   { platform: 'google', displayName: 'Google AI Studio', docsUrl: '', apiBaseUrl: '', requiresKey: true },
@@ -133,6 +133,8 @@ export default function KeysPage() {
   const [apiKey, setApiKey] = useState('')
   const [accountId, setAccountId] = useState('')
   const [label, setLabel] = useState('')
+  const [copiedKeyId, setCopiedKeyId] = useState<number | null>(null)
+  const [copyError, setCopyError] = useState<string | null>(null)
 
   const { data: keys = [], isLoading } = useQuery<ApiKey[]>({
     queryKey: ['keys'],
@@ -208,6 +210,19 @@ export default function KeysPage() {
     ...p,
     keys: keys.filter(k => k.platform === p.platform),
   })).filter(p => p.keys.length > 0)
+
+  async function copyProviderKey(keyId: number) {
+    try {
+      const { key } = await apiFetch<ApiKeySecret>(`/api/keys/${keyId}/secret`)
+      await navigator.clipboard.writeText(key)
+      setCopyError(null)
+      setCopiedKeyId(keyId)
+      window.setTimeout(() => setCopiedKeyId(current => current === keyId ? null : current), 1400)
+    } catch (error) {
+      setCopiedKeyId(null)
+      setCopyError((error as Error).message || 'Could not copy provider key')
+    }
+  }
 
   return (
     <div>
@@ -302,6 +317,9 @@ export default function KeysPage() {
             </div>
           ) : (
             <div className="space-y-6">
+              {copyError && (
+                <p className="text-destructive text-xs">{copyError}</p>
+              )}
               {grouped.map(group => (
                 <div key={group.platform}>
                   <div className="mb-2 flex items-start justify-between gap-3">
@@ -318,6 +336,7 @@ export default function KeysPage() {
                       const h = healthKeyMap.get(k.id)
                       const status = h?.status ?? k.status
                       const lastChecked = h?.lastCheckedAt
+                      const copied = copiedKeyId === k.id
                       return (
                         <div key={k.id} className="flex items-center gap-3 px-4 py-3 hover:bg-muted/40 transition-colors">
                           <span className={`size-1.5 rounded-full flex-shrink-0 ${statusDot[status] ?? statusDot.unknown}`} />
@@ -332,6 +351,15 @@ export default function KeysPage() {
                           )}
                           <Button variant="ghost" size="xs" onClick={() => checkKey.mutate(k.id)} disabled={checkKey.isPending}>
                             Check
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            title={copied ? 'Copied' : 'Copy stored credential'}
+                            aria-label={`Copy ${group.displayName} stored credential`}
+                            onClick={() => void copyProviderKey(k.id)}
+                          >
+                            {copied ? <Check className="text-emerald-500" /> : <Clipboard />}
                           </Button>
                           <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive" onClick={() => deleteKey.mutate(k.id)} disabled={deleteKey.isPending}>
                             Remove

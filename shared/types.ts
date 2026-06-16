@@ -83,6 +83,11 @@ export interface ApiKey {
   lastCheckedAt: string | null;
 }
 
+export interface ApiKeySecret {
+  id: number;
+  key: string;
+}
+
 export interface ApiKeyCreate {
   platform: Platform;
   key: string;

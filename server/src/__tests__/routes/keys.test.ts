@@ -65,6 +65,21 @@ describe('Keys API', () => {
     expect(body[0].platform).toBe('groq');
   });
 
+  it('GET /api/keys/:id/secret returns the stored provider credential on demand', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', {
+      platform: 'cloudflare',
+      key: 'account-123:cf-token-456',
+      label: 'Cloudflare project',
+    });
+
+    const { status, body } = await request(app, 'GET', `/api/keys/${created.id}/secret`);
+    expect(status).toBe(200);
+    expect(body).toEqual({
+      id: created.id,
+      key: 'account-123:cf-token-456',
+    });
+  });
+
   it('POST /api/keys rejects invalid platform', async () => {
     const { status } = await request(app, 'POST', '/api/keys', {
       platform: 'invalid_platform',

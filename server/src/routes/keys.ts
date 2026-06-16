@@ -71,6 +71,34 @@ keysRouter.post('/', (req: Request, res: Response) => {
   });
 });
 
+// Reveal one stored key on demand for clipboard copy. The list endpoint stays masked.
+keysRouter.get('/:id/secret', (req: Request, res: Response) => {
+  const id = parseInt(req.params.id as string, 10);
+  if (isNaN(id)) {
+    res.status(400).json({ error: { message: 'Invalid key ID' } });
+    return;
+  }
+
+  const db = getDb();
+  const row = db.prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE id = ?').get(id) as
+    | { encrypted_key: string; iv: string; auth_tag: string }
+    | undefined;
+
+  if (!row) {
+    res.status(404).json({ error: { message: 'Key not found' } });
+    return;
+  }
+
+  try {
+    res.json({
+      id,
+      key: decrypt(row.encrypted_key, row.iv, row.auth_tag),
+    });
+  } catch {
+    res.status(500).json({ error: { message: 'Failed to decrypt key' } });
+  }
+});
+
 // Delete a key
 keysRouter.delete('/:id', (req: Request, res: Response) => {
   const id = parseInt(req.params.id as string, 10);
